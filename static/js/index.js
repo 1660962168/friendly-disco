@@ -441,10 +441,10 @@ function updatePerformance() {
 }
 
 // 1. 页面加载完成后立即调用一次
-updatePerformance();
+// updatePerformance();
 
 // 2. 之后每隔 2000 毫秒 (2秒) 自动刷新一次
-setInterval(updatePerformance, 2000);
+// setInterval(updatePerformance, 2000);
 
 // --- 9. 主题切换逻辑 ---
 function initTheme() {
