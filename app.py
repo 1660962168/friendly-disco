@@ -15,12 +15,11 @@ import config
 from exts import db
 from models import *
 from flask_migrate import Migrate
+from paddleocr import PaddleOCR
 
 
-# --- 1. 配置 Flask ---
-# 注意：这里需要处理静态文件路径，否则打包后会找不到 html/css
-# 如果你是直接运行 py 文件，直接 app = Flask(__name__) 即可
-# 但为了兼容打包，建议指定 template_folder 和 static_folder
+
+ocr = PaddleOCR(use_textline_orientation=True, lang="ch")
 
 def get_resource_path(relative_path):
     """ 获取资源绝对路径（兼容 PyInstaller 打包） """
@@ -92,70 +91,73 @@ def detect_image():
         return jsonify({'error': 'No file selected'}), 400
 
     try:
-        # --- 0. 清理旧文件 ---
         cleanup_old_files(UPLOAD_FOLDER, limit=30)
         cleanup_old_files(RESULTS_FOLDER, limit=30)
         cleanup_old_files(CROPS_FOLDER, limit=30)
-
-        # --- 1. 安全保存文件 (使用纯UUID重命名，避免特殊字符和超长路径) ---
-        ext = os.path.splitext(file.filename)[1] # 获取后缀 (.jpg)
+        ext = os.path.splitext(file.filename)[1]
         if not ext: ext = ".jpg"
-        
-        safe_filename = f"{uuid.uuid4().hex}{ext}" # 例如: a1b2c3d4.jpg
+        safe_filename = f"{uuid.uuid4().hex}{ext}" 
         filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
         file.save(filepath)
-
-        # --- 2. YOLO 推理 ---
         results = model(filepath)
         result = results[0]
-
-        # --- 3. 绘制并保存结果 ---
         annotated_frame = result.plot()
         result_filename = f"result_{safe_filename}"
         result_path = os.path.join(RESULTS_FOLDER, result_filename)
         cv2.imwrite(result_path, annotated_frame)
-
-        # --- 4. 数据提取 (车牌 + 置信度) ---
         boxes = result.boxes.xyxy.cpu().numpy()
         conf_scores = result.boxes.conf.cpu().numpy()
         
         has_plate = False
         crop_filename = ""
         confidence = 0.0
-
         if len(boxes) > 0:
-            # 取第一个框
             box = boxes[0]
-            confidence = float(conf_scores[0]) # 提取置信度
-            
+            confidence = float(conf_scores[0])
             x1, y1, x2, y2 = map(int, box)
-            
-            # 裁剪
             original_img = cv2.imread(filepath)
             h, w, _ = original_img.shape
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(w, x2), min(h, y2)
             plate_crop = original_img[y1:y2, x1:x2]
-            
-            # 保存裁剪图
             crop_filename = f"crop_{safe_filename}"
             crop_path = os.path.join(CROPS_FOLDER, crop_filename)
             cv2.imwrite(crop_path, plate_crop)
-            
-            # 保存临时图供下一步使用
             temp_crop_path = os.path.join(CROPS_FOLDER, 'temp_plate.jpg')
             cv2.imwrite(temp_crop_path, plate_crop)
-            
             has_plate = True
+        plate_text = ""
+        plate_confidence = 0.0
+    
+        if has_plate:
+            try:
+                # 使用 PaddleOCR 识别刚才裁剪下来的车牌图片 (temp_plate.jpg)
+                # 这里的 temp_crop_path 是你之前代码里保存的 'static/crops/temp_plate.jpg'
+                # 或者直接传 numpy 数组: ocr_result = ocr.ocr(plate_crop, cls=True)
+            
+                ocr_result = ocr.ocr(temp_crop_path, cls=True)
+            
+                # PaddleOCR 返回的结构比较复杂，通常是 [[[[x1,y1],...], ("识别文本", 置信度)]]
+                # 我们需要解析它。对于车牌，通常只有一行文本。
+                if ocr_result and ocr_result[0]:
+                    # 取第一行识别结果
+                    res = ocr_result[0][0] 
+                    # res[1][0] 是文本，res[1][1] 是置信度
+                    plate_text = res[1][0]
+                    plate_confidence = float(res[1][1])
+                    print(f"OCR 识别结果: {plate_text}, 置信度: {plate_confidence}")
+            except Exception as e:
+                print(f"OCR 识别出错: {e}")
 
-        # --- 5. 返回 JSON ---
         return jsonify({
             'success': True,
             'original_url': url_for('static', filename=f'uploads/{safe_filename}'),
             'result_url': url_for('static', filename=f'results/{result_filename}'),
             'has_plate': has_plate,
             'confidence': confidence, # 返回置信度 (0.0 - 1.0)
-            'crop_url': url_for('static', filename=f'crops/{crop_filename}') if has_plate else None
+            'crop_url': url_for('static', filename=f'crops/{crop_filename}') if has_plate else None,
+            'plate_text': plate_text,      # 新增：返回识别到的车牌号
+            'confidence': plate_confidence
         })
 
     except Exception as e:
