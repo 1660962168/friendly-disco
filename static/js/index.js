@@ -480,79 +480,104 @@ window.handleImageUpload = function(input) {
     if (input.files && input.files[0]) {
         const file = input.files[0];
         
-        // 1. 获取 DOM 元素
         const uploadArea = document.getElementById('image-upload-area');
         const resultContainer = document.getElementById('image-result-container');
         const loading = document.getElementById('image-loading');
         const previewImg = document.getElementById('image-preview');
         
-        // 2. 切换界面状态：显示 loading
+        // 状态显示的元素
+        const statusBadge = document.getElementById('status-badge');
+        const charConfEl = document.getElementById('char-conf');
+        // 可选：你可以在HTML里加一个专门显示车牌号的文字区域，比如 id="plate-number-display"
+        
         uploadArea.classList.add('hidden'); 
         resultContainer.classList.remove('hidden');
-        loading.classList.remove('hidden'); // 确保 loading 显示
+        loading.classList.remove('hidden'); // 显示 "AI 正在识别中..."
 
-        // 3. 发送请求
         const formData = new FormData();
         formData.append('file', file);
 
-        fetch('/api/detect/image', {
+        // --- 第一步：请求 YOLO 检测 ---
+        fetch('/api/detect/yolo', {
             method: 'POST',
             body: formData
         })
         .then(response => response.json())
         .then(data => {
             if (data.success) {
-                console.log("识别成功，置信度:", data.confidence);
-                
-                // --- A. 更新图片 (加时间戳防止缓存) ---
+                // 1. YOLO 成功：立刻显示带框的图片
                 previewImg.src = data.result_url + '?t=' + new Date().getTime();
-                
-                // --- B. 更新状态文字 ---
-                const statusBadge = document.getElementById('status-badge');
-                if(statusBadge) {
-                    statusBadge.innerText = data.has_plate ? "识别成功" : "未检测到车牌";
-                    statusBadge.className = data.has_plate 
-                        ? "px-3 py-1.5 rounded-lg text-xs bg-emerald-50 text-emerald-600 border border-emerald-200 dark:bg-emerald-500/20 dark:text-emerald-400 dark:border-emerald-500/30"
-                        : "px-3 py-1.5 rounded-lg text-xs bg-yellow-50 text-yellow-600 border border-yellow-200";
-                }
+                loading.classList.add('hidden'); // 隐藏全屏 Loading，让用户看到图
 
-                // --- C. 更新置信度显示 (关键) ---
-                if (data.confidence !== undefined) {
-                    // 转换成百分比，例如 0.985 -> 98.5%
-                    const confPercent = (data.confidence * 100).toFixed(1) + '%';
-                    
-                    // 1. 更新中间的 "平均置信度"
-                    const charConfEl = document.getElementById('char-conf');
-                    if (charConfEl) {
-                        charConfEl.innerText = confPercent;
-                        charConfEl.className = data.confidence > 0.8 
-                            ? "text-2xl text-emerald-400 font-mono" 
-                            : "text-2xl text-yellow-400 font-mono";
+                if (data.has_plate && data.crop_filename) {
+                    // 更新状态：正在识别文字
+                    if(statusBadge) {
+                        statusBadge.innerText = "定位成功，正在分析文字...";
+                        statusBadge.className = "px-3 py-1.5 rounded-lg text-xs bg-blue-50 text-blue-600 border border-blue-200 animate-pulse";
                     }
+                    if(charConfEl) charConfEl.innerText = "--%";
 
-                    // 2. 更新左侧大的 "识别成功率" (可选，如果你想让左边也动)
-                    const statRateEl = document.getElementById('stat-rate');
-                    if (statRateEl) statRateEl.innerText = confPercent;
+                    // --- 第二步：请求 OCR 识别 ---
+                    // 这里传入 YOLO 返回的文件名
+                    startOcrRequest(data.crop_filename); 
+
+                } else {
+                    // 没检测到车牌
+                    if(statusBadge) {
+                        statusBadge.innerText = "未检测到车牌";
+                        statusBadge.className = "px-3 py-1.5 rounded-lg text-xs bg-yellow-50 text-yellow-600 border border-yellow-200";
+                    }
                 }
-                
             } else {
-                alert('后端报错: ' + (data.error || '未知错误'));
+                alert('YOLO 识别出错: ' + data.error);
                 resetImageUpload();
             }
         })
         .catch(err => {
-            console.error("请求失败:", err);
-            alert('网络请求失败，请检查控制台');
+            console.error(err);
+            alert('网络请求失败');
             resetImageUpload();
-        })
-        .finally(() => {
-            // --- 4. 强制隐藏 Loading 动画 ---
-            // 无论成功还是失败，这行代码必须执行
-            if (loading) {
-                loading.classList.add('hidden');
-            }
+            loading.classList.add('hidden');
         });
     }
+}
+
+function startOcrRequest(cropFilename) {
+    fetch('/api/detect/ocr', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ crop_filename: cropFilename })
+    })
+    .then(response => response.json())
+    .then(data => {
+        const statusBadge = document.getElementById('status-badge');
+        const charConfEl = document.getElementById('char-conf');
+        
+        if (data.success) {
+            console.log("OCR 结果:", data.plate_text);
+            
+            // 更新文字显示
+            if(statusBadge) {
+                statusBadge.innerText = data.plate_text ? `识别成功: ${data.plate_text}` : "文字识别失败";
+                statusBadge.className = data.plate_text 
+                    ? "px-3 py-1.5 rounded-lg text-xs bg-emerald-50 text-emerald-600 border border-emerald-200"
+                    : "px-3 py-1.5 rounded-lg text-xs bg-orange-50 text-orange-600 border border-orange-200";
+            }
+
+            // 更新置信度
+            if (charConfEl && data.confidence) {
+                charConfEl.innerText = (data.confidence * 100).toFixed(1) + '%';
+                charConfEl.className = data.confidence > 0.8 
+                            ? "text-2xl text-emerald-400 font-mono" 
+                            : "text-2xl text-yellow-400 font-mono";
+            }
+        }
+    })
+    .catch(err => {
+        console.error("OCR 请求失败:", err);
+    });
 }
 
 // 重置界面，允许再次上传

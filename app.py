@@ -24,7 +24,16 @@ import traceback
 # 初始化 PaddleOCR
 # use_textline_orientation=False: 关闭方向检测，防止车牌被误判旋转
 # lang="ch": 支持中英文
-ocr = PaddleOCR(use_textline_orientation=False, lang="ch")
+ocr_engine = None 
+
+def get_ocr_model():
+    """ 懒加载 OCR 模型单例模式 """
+    global ocr_engine
+    if ocr_engine is None:
+        print("正在初始化 OCR 模型 (第一次运行会稍慢)...")
+        # 关掉 show_log 防止报错，关掉方向检测
+        ocr_engine = PaddleOCR(use_textline_orientation=False, lang="ch")
+    return ocr_engine
 
 def get_resource_path(relative_path):
     """ 获取资源绝对路径（兼容 PyInstaller 打包） """
@@ -82,196 +91,164 @@ except Exception as e:
 
 
 # --- 3. 核心路由 ---
-
-@app.route('/api/detect/image', methods=['POST'])
-def detect_image():
+@app.route('/api/detect/yolo', methods=['POST'])
+def detect_yolo():
     if not model:
         return jsonify({'error': 'Model not loaded'}), 500
-        
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
-        
+    
     file = request.files['file']
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
 
     try:
-        # 0. 清理旧文件
         cleanup_old_files(UPLOAD_FOLDER, limit=30)
         cleanup_old_files(RESULTS_FOLDER, limit=30)
         cleanup_old_files(CROPS_FOLDER, limit=30)
 
-        # 1. 保存文件
         ext = os.path.splitext(file.filename)[1]
         if not ext: ext = ".jpg"
         safe_filename = f"{uuid.uuid4().hex}{ext}" 
         filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
         file.save(filepath)
 
-        # 2. YOLO 推理
+        # YOLO 推理
         results = model(filepath)
         result = results[0]
         
-        # 保存检测结果图
         annotated_frame = result.plot()
         result_filename = f"result_{safe_filename}"
         result_path = os.path.join(RESULTS_FOLDER, result_filename)
         cv2.imwrite(result_path, annotated_frame)
 
-        # 3. 提取数据
         boxes = result.boxes.xyxy.cpu().numpy()
         conf_scores = result.boxes.conf.cpu().numpy()
         
         has_plate = False
         crop_filename = ""
         yolo_confidence = 0.0
-        
-        # 初始化 OCR 结果变量
-        plate_text = ""
-        plate_confidence = 0.0
 
         if len(boxes) > 0:
             box = boxes[0]
             yolo_confidence = float(conf_scores[0])
             
-            # --- [关键优化] 增加 Padding (内边距) ---
-            # 防止 YOLO 框切到字符边缘，导致 OCR 识别错误
-            padding_x = 10
-            padding_y = 10
-            
+            # Padding (保持之前的优化)
+            padding_x, padding_y = 10, 10
             x1 = int(box[0]) - padding_x
             y1 = int(box[1]) - padding_y
             x2 = int(box[2]) + padding_x
             y2 = int(box[3]) + padding_y
             
-            # 读取原图
             original_img = cv2.imread(filepath)
             h, w, _ = original_img.shape
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
             
-            # 边界检查
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(w, x2)
-            y2 = min(h, y2)
-            
-            # 裁剪
             plate_crop = original_img[y1:y2, x1:x2]
             
-            # 保存裁剪图
+            # 保存裁剪图 (OCR 将读取这个文件)
             crop_filename = f"crop_{safe_filename}"
             crop_path = os.path.join(CROPS_FOLDER, crop_filename)
             cv2.imwrite(crop_path, plate_crop)
             
-            # 保存临时图 (虽然现在主要用内存里的 plate_crop 处理)
-            temp_crop_path = os.path.join(CROPS_FOLDER, 'temp_plate.jpg')
-            cv2.imwrite(temp_crop_path, plate_crop)
-            
             has_plate = True
 
-            # ================= [终极优化] OCR 双向识别 + 格式修正 =================
-            try:
-                # 1. 放大图片 (提升小图识别率)
-                roi = cv2.resize(plate_crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-                
-                # 2. 转灰度
-                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                
-                # 3. 反色 (针对蓝牌白字)
-                gray_inv = cv2.bitwise_not(gray)
-
-                # --- [关键修复] 转回 3 通道 BGR ---
-                # PaddleOCR v3+ 强制要求输入 (H, W, 3)，否则报 tuple index out of range
-                gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                gray_inv_bgr = cv2.cvtColor(gray_inv, cv2.COLOR_GRAY2BGR)
-                
-                # 省份简称列表
-                PROVINCES = "京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领"
-                candidates = []
-
-                # 执行两次识别：一次原图(灰度)，一次反色(灰度)
-                for img_input, label in [(gray_bgr, "Normal"), (gray_inv_bgr, "Inverted")]:
-                    
-                    # 调试：保存送入 OCR 的图片
-                    # debug_path = os.path.join(CROPS_FOLDER, f'debug_{label}.jpg')
-                    # cv2.imwrite(debug_path, img_input)
-                    
-                    # 识别
-                    res = ocr.predict(img_input)
-                    
-                    # 解析结果
-                    text_res = ""
-                    score_res = 0.0
-
-                    if res:
-                        # 兼容 res 是列表的情况
-                        if isinstance(res, list) and len(res) > 0:
-                            item = res[0]
-                            # 适配 v3 字典格式
-                            if isinstance(item, dict) and 'rec_texts' in item and len(item['rec_texts']) > 0:
-                                text_res = item['rec_texts'][0]
-                                score_res = float(item['rec_scores'][0])
-                            # 适配 v2 列表格式
-                            elif isinstance(item, list) and len(item) >= 2:
-                                text_res = item[1][0]
-                                score_res = float(item[1][1])
-                    
-                    # 结果清洗与评分
-                    if text_res:
-                        # 1. 正则清洗：只留 汉字、大写字母、数字
-                        clean_text = re.sub(r'[^\u4e00-\u9fa5A-Z0-9]', '', text_res)
-                        
-                        is_valid = False
-                        current_score = score_res
-                        
-                        # 2. 校验：首字符是否为省份
-                        if len(clean_text) >= 2:
-                            if clean_text[0] in PROVINCES:
-                                is_valid = True
-                                current_score += 0.5 # 奖励分
-                        
-                        # 3. 校验：蓝牌反色模式下的有效结果通常更准
-                        if label == "Inverted" and is_valid:
-                            current_score += 0.2
-                        
-                        if len(clean_text) > 1:
-                            candidates.append({
-                                'text': clean_text,
-                                'score': current_score,
-                                'valid': is_valid,
-                                'mode': label
-                            })
-
-                # 挑选最佳结果
-                if candidates:
-                    # 排序：Valid优先 > 分数高优先
-                    candidates.sort(key=lambda x: (x['valid'], x['score']), reverse=True)
-                    best = candidates[0]
-                    
-                    plate_text = best['text']
-                    # 限制最高置信度显示为 0.99
-                    plate_confidence = min(0.99, best['score'])
-                    
-                    print(f"OCR 最终选择 ({best['mode']}): {plate_text} (原始分:{best['score']:.2f} 置信度:{plate_confidence:.2f})")
-                else:
-                    print("OCR 双向识别均未找到有效车牌")
-
-            except Exception as e:
-                print(f"OCR 识别流程出错: {e}")
-                traceback.print_exc()
-
-        # 4. 返回 JSON
+        # [修改] 这里不再跑 OCR，只返回图片路径给前端
         return jsonify({
             'success': True,
             'original_url': url_for('static', filename=f'uploads/{safe_filename}'),
             'result_url': url_for('static', filename=f'results/{result_filename}'),
             'has_plate': has_plate,
+            'crop_filename': crop_filename if has_plate else None, # 传文件名给前端，用于下一步请求
             'crop_url': url_for('static', filename=f'crops/{crop_filename}') if has_plate else None,
-            'plate_text': plate_text,       # 识别到的车牌文本
-            'confidence': plate_confidence  # OCR 置信度 (用于前端展示)
+            'yolo_confidence': yolo_confidence
         })
 
     except Exception as e:
-        print(f"Error during detection: {e}")
+        print(f"YOLO Error: {e}")
+        return jsonify({'error': str(e)}), 500
+@app.route('/api/detect/ocr', methods=['POST'])
+def detect_ocr():
+    # 获取前端传来的裁剪文件名
+    data = request.json
+    crop_filename = data.get('crop_filename')
+    
+    if not crop_filename:
+        return jsonify({'error': 'No crop filename provided'}), 400
+        
+    crop_path = os.path.join(CROPS_FOLDER, crop_filename)
+    if not os.path.exists(crop_path):
+        return jsonify({'error': 'Crop file not found'}), 404
+
+    plate_text = ""
+    plate_confidence = 0.0
+
+    try:
+        # [优化] 获取懒加载的 OCR 模型
+        ocr = get_ocr_model()
+
+        # 读取图片
+        plate_crop = cv2.imread(crop_path)
+        
+        # === 之前的 OCR 增强逻辑 (放大/灰度/反色) ===
+        roi = cv2.resize(plate_crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray_inv = cv2.bitwise_not(gray)
+        gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        gray_inv_bgr = cv2.cvtColor(gray_inv, cv2.COLOR_GRAY2BGR)
+        
+        PROVINCES = "京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领"
+        candidates = []
+
+        # 双向识别
+        for img_input, label in [(gray_bgr, "Normal"), (gray_inv_bgr, "Inverted")]:
+            res = ocr.predict(img_input)
+            
+            text_res = ""
+            score_res = 0.0
+            
+            if res:
+                if isinstance(res, list) and len(res) > 0:
+                    item = res[0]
+                    if isinstance(item, dict) and 'rec_texts' in item and len(item['rec_texts']) > 0:
+                        text_res = item['rec_texts'][0]
+                        score_res = float(item['rec_scores'][0])
+                    elif isinstance(item, list) and len(item) >= 2:
+                        text_res = item[1][0]
+                        score_res = float(item[1][1])
+            
+            if text_res:
+                clean_text = re.sub(r'[^\u4e00-\u9fa5A-Z0-9]', '', text_res)
+                is_valid = False
+                current_score = score_res
+                if len(clean_text) >= 2 and clean_text[0] in PROVINCES:
+                    is_valid = True
+                    current_score += 0.5
+                if label == "Inverted" and is_valid:
+                    current_score += 0.2
+                
+                if len(clean_text) > 1:
+                    candidates.append({'text': clean_text, 'score': current_score, 'valid': is_valid, 'mode': label})
+
+        if candidates:
+            candidates.sort(key=lambda x: (x['valid'], x['score']), reverse=True)
+            best = candidates[0]
+            plate_text = best['text']
+            plate_confidence = min(0.99, best['score'])
+            print(f"OCR Success: {plate_text}")
+        else:
+            print("OCR Failed to find valid text")
+
+        return jsonify({
+            'success': True,
+            'plate_text': plate_text,
+            'confidence': plate_confidence
+        })
+
+    except Exception as e:
+        print(f"OCR Error: {e}")
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 
@@ -327,6 +304,7 @@ if __name__ == '__main__':
     t.start()
 
     # 启动 GUI 窗口
+    icon_path = get_resource_path('apple-touch-icon.png')
     window = webview.create_window(
         title="车牌识别系统",
         url='http://127.0.0.1:5000',
@@ -335,6 +313,4 @@ if __name__ == '__main__':
         resizable=True,
         confirm_close=True,
     )
-    
-    icon_path = get_resource_path('apple-touch-icon.png')
     webview.start(icon=icon_path)
