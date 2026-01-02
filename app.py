@@ -32,7 +32,12 @@ def get_ocr_model():
     if ocr_engine is None:
         print("正在初始化 OCR 模型 (第一次运行会稍慢)...")
         # 关掉 show_log 防止报错，关掉方向检测
-        ocr_engine = PaddleOCR(use_textline_orientation=False, lang="ch")
+        ocr_engine = PaddleOCR(
+            text_detection_model_name="PP-OCRv5_server_det",
+            text_recognition_model_name="PP-OCRv5_server_rec",
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False)
     return ocr_engine
 
 def get_resource_path(relative_path):
@@ -186,7 +191,7 @@ def detect_ocr():
 
     try:
         # [优化] 获取懒加载的 OCR 模型
-        ocr = get_ocr_model()
+        
 
         # 读取图片
         plate_crop = cv2.imread(crop_path)
@@ -302,7 +307,7 @@ if __name__ == '__main__':
     t = threading.Thread(target=start_flask)
     t.daemon = True
     t.start()
-
+    ocr = get_ocr_model()
     # 启动 GUI 窗口
     icon_path = get_resource_path('apple-touch-icon.png')
     window = webview.create_window(
