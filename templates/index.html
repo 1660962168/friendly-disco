@@ -439,7 +439,7 @@
                             </div>
                         </div>
                         <div class="flex items-center gap-2">
-                            <button class="p-2 rounded-lg hover:bg-white/5 transition-colors">
+                            <button id="btn-download-history" class="p-2 rounded-lg hover:bg-white/5 transition-colors">
                                 <i data-lucide="download" class="w-4 h-4 text-gray-400"></i>
                             </button>
                         </div>
@@ -450,14 +450,11 @@
                             <i data-lucide="search"
                                 class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500 dark:text-gray-400"></i>
 
-                            <input type="text" placeholder="搜索车牌号..." class="w-full pl-10 pr-10 py-2.5 
-               /* 白天模式样式 */
+                            <input id="history-search-input" type="text" placeholder="搜索车牌号..." class="w-full pl-10 pr-10 py-2.5 
                bg-gray-50 border-gray-200 text-gray-900 placeholder-gray-400
                focus:bg-white focus:border-cyan-500
-               /* 夜间模式样式 (dark:) */
                dark:bg-gray-800/50 dark:border-gray-700/50 dark:text-white dark:placeholder-gray-500 
                dark:focus:bg-gray-800/70 dark:focus:border-cyan-500/50
-               /* 通用样式 */
                border rounded-lg text-sm focus:outline-none transition-all" />
                         </div>
                     </div>
@@ -551,20 +548,24 @@
                                     识别引擎参数
                                 </h4>
                                 <div class="space-y-3">
-                                    <div class="flex items-center justify-between">
-                                        <div class="flex items-center gap-2">
-                                            <i data-lucide="gauge"
-                                                class="w-4 h-4 text-gray-400 dark:text-cyan-400/70"></i>
-                                            <span class="text-sm text-gray-600 dark:text-gray-300">置信度阈值</span>
-                                        </div>
-                                        <div class="flex items-center gap-3">
-                                            <input type="range" min="0" max="100" value="85" class="w-32 h-1 rounded-lg appearance-none cursor-pointer accent-cyan-500
-                                                      bg-gray-300 dark:bg-gray-700">
-                                            <span
-                                                class="text-sm w-12 text-right font-mono font-bold text-cyan-600 dark:text-cyan-400">85%</span>
-                                        </div>
-                                    </div>
-                                </div>
+    <div class="flex items-center justify-between">
+        <div class="flex items-center gap-2">
+            <i data-lucide="gauge" class="w-4 h-4 text-gray-400 dark:text-cyan-400/70"></i>
+            <span class="text-sm text-gray-600 dark:text-gray-300">置信度阈值</span>
+        </div>
+        <div class="flex items-center gap-3">
+            <input type="range" min="0" max="100" 
+                   value="{{ config.confidence_threshold }}" 
+                   id="conf-threshold-input"
+                   class="w-32 h-1 rounded-lg appearance-none cursor-pointer accent-cyan-500 bg-gray-300 dark:bg-gray-700">
+            
+            <span id="conf-threshold-display" 
+                  class="text-sm w-12 text-right font-mono font-bold text-cyan-600 dark:text-cyan-400">
+                  {{ config.confidence_threshold }}%
+            </span>
+        </div>
+    </div>
+</div>
                             </div>
                         </div>
                     </div>
@@ -585,11 +586,11 @@
                                dark:bg-gray-800/50 dark:border-gray-600/50 dark:text-white dark:hover:bg-gray-700/70">
                         取消
                     </button>
-                    <button onclick="toggleSettings(false)"
-                        class="px-5 py-2 rounded-lg text-sm cursor-pointer text-white transition-all shadow-lg
-                               bg-gradient-to-r from-cyan-500 to-emerald-500 hover:from-cyan-600 hover:to-emerald-600 shadow-cyan-500/20 dark:shadow-cyan-500/30">
-                        保存设置
-                    </button>
+                    <button onclick="saveSettings()"
+    class="px-5 py-2 rounded-lg text-sm cursor-pointer text-white transition-all shadow-lg
+           bg-gradient-to-r from-cyan-500 to-emerald-500 hover:from-cyan-600 hover:to-emerald-600 shadow-cyan-500/20 dark:shadow-cyan-500/30">
+    保存设置
+</button>
                 </div>
             </div>
         </div>

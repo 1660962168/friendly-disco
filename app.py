@@ -3,12 +3,11 @@ import threading
 import sys
 import os
 import glob
-from flask import Flask, render_template, jsonify, request, url_for
+from flask import Flask, render_template, jsonify, request, url_for,make_response
 import psutil
 import GPUtil
 from ultralytics import YOLO
 import cv2
-import numpy as np
 import uuid
 import pathlib
 import re
@@ -17,14 +16,18 @@ import time  # [新增] 导入 time 模块
 from exts import db
 from models import *
 from flask_migrate import Migrate
+os.environ['DISABLE_MODEL_SOURCE_CHECK'] = 'True'
 from paddleocr import PaddleOCR
 import traceback
 from sqlalchemy import func
+import csv
+import io
 
 # --- 1. 全局配置与初始化 ---
 
 # 初始化 PaddleOCR
 ocr_engine = None 
+
 
 def get_ocr_model():
     """ 懒加载 OCR 模型单例模式 """
@@ -116,7 +119,19 @@ def detect_yolo():
         filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
         file.save(filepath)
 
-        results = model(filepath)
+        # --- [新增] 获取数据库置信度阈值 ---
+        conf_threshold = 0.25  # 默认值，防止数据库读取失败
+        try:
+            sys_config = SystemConfig.query.first()
+            if sys_config:
+                # 数据库存的是 0-100 的整数，YOLO 需要 0.0-1.0 的浮点数
+                conf_threshold = sys_config.confidence_threshold / 100.0
+                print(f"使用置信度阈值: {conf_threshold}")
+        except Exception as e:
+            print(f"读取配置失败，使用默认阈值: {e}")
+
+        # --- [修改] 将阈值传入模型 ---
+        results = model(filepath, conf=conf_threshold)
         result = results[0]
         
         annotated_frame = result.plot()
@@ -196,7 +211,7 @@ def detect_ocr():
     plate_confidence = 0.0
 
     try:
-        # [修改] 修复 OCR 模型调用
+        # 获取 OCR 模型
         ocr = get_ocr_model()
 
         plate_crop = cv2.imread(crop_path)
@@ -258,22 +273,38 @@ def detect_ocr():
             if len(plate_text) != 7 and len(plate_text) != 8:
                  status = 0
             
-            # [修改] 存入数据库，包含 duration 和 confidence
+            # --- [核心修改部分] 开始 ---
             try:
-                # 先查询是否存在相同的车牌，如果存在则更新，不存在则插入
-                # 为了演示简单，这里直接插入，如果报错(Unique constraint)则忽略或打印
-                record = LicensePlate(
-                    plate_text=plate_text,
-                    type=plate_type,
-                    status=status,
-                    confidence=plate_confidence,
-                    duration=duration
-                )
-                db.session.add(record)
-                db.session.commit()
+                # 1. 先查询数据库里有没有这个车牌
+                existing_record = LicensePlate.query.filter_by(plate_text=plate_text).first()
+                
+                if existing_record:
+                    # 2. 如果有：更新它的时间和其他信息
+                    existing_record.time = datetime.now() # 刷新时间到当前
+                    existing_record.type = plate_type
+                    existing_record.status = status
+                    existing_record.confidence = plate_confidence
+                    existing_record.duration = duration
+                    
+                    db.session.commit()
+                    print(f"已更新旧记录: {plate_text} -> 时间已刷新")
+                else:
+                    # 3. 如果没有：插入新记录
+                    record = LicensePlate(
+                        plate_text=plate_text,
+                        type=plate_type,
+                        status=status,
+                        confidence=plate_confidence,
+                        duration=duration
+                    )
+                    db.session.add(record)
+                    db.session.commit()
+                    print(f"已插入新记录: {plate_text}")
+
             except Exception as db_e:
-                print(f"Database Save Error (Might be duplicate): {db_e}")
+                print(f"Database Error: {db_e}")
                 db.session.rollback()
+            # --- [核心修改部分] 结束 ---
 
         else:
             print("OCR Failed to find valid text")
@@ -282,7 +313,7 @@ def detect_ocr():
             'success': True,
             'plate_text': plate_text,
             'confidence': plate_confidence,
-            'duration': duration  # [新增] 返回用时
+            'duration': duration
         })
 
     except Exception as e:
@@ -355,41 +386,113 @@ def stats_distribution():
 
 @app.route('/api/stats/history')
 def stats_history():
-    """ 历史记录 (最新的20条) """
-    # 按时间倒序查询
-    logs = LicensePlate.query.order_by(LicensePlate.time.desc()).limit(20).all()
+    """ 历史记录 (全部数据，支持搜索) & 全局统计 """
+    # 1. 获取搜索参数
+    search_query = request.args.get('search', '').strip()
+    
+    # 2. 构建日志查询 (Logs Query) - 仅影响列表显示
+    log_query = LicensePlate.query
+    if search_query:
+        log_query = log_query.filter(LicensePlate.plate_text.contains(search_query))
+    
+    # [修改点] 获取过滤后的“全部”数据，按时间倒序排列 (去掉了 .limit(20))
+    logs = log_query.order_by(LicensePlate.time.desc()).all()
     
     history_data = []
     for log in logs:
         history_data.append({
             'id': log.id,
-            'time': log.time.strftime('%H:%M:%S'),
+            # 格式化时间，包含年月日以便查看历史
+            'time': log.time.strftime('%Y-%m-%d %H:%M:%S'),
             'plate': log.plate_text,
             'status': 'success' if log.status == 1 else 'failed',
-            'confidence': round(log.confidence * 100, 1),
-            'location': '默认入口', # 数据库未存地点，暂用默认
+            'confidence': round(log.confidence * 100, 1) if log.confidence else 0,
+            'location': '默认入口',
             'duration': log.duration
         })
         
-    # 同时计算一下总计数据
+    # 3. 构建全局统计 (Global Stats) - 不受搜索影响，反映系统整体状况
     total_count = LicensePlate.query.count()
     success_count = LicensePlate.query.filter_by(status=1).count()
     failed_count = LicensePlate.query.filter_by(status=0).count()
+    
+    # 计算平均用时
+    avg_duration = db.session.query(func.avg(LicensePlate.duration)).scalar()
+    avg_duration = round(avg_duration, 2) if avg_duration else 0.00
     
     return jsonify({
         'logs': history_data,
         'stats': {
             'total': total_count,
             'success': success_count,
-            'failed': failed_count
+            'failed': failed_count,
+            'avg_time': avg_duration  # 返回平均用时
         }
     })
+
+@app.route('/api/download/history')
+def download_history():
+    """ 导出所有历史记录为 CSV """
+    # 查询所有数据，按时间倒序
+    records = LicensePlate.query.order_by(LicensePlate.time.desc()).all()
+    
+    # 使用 StringIO 在内存中构建 CSV
+    si = io.StringIO()
+    cw = csv.writer(si)
+    
+    # 写入表头
+    cw.writerow(['ID', '时间', '车牌号', '车辆类型', '识别状态', '置信度', '识别耗时(秒)'])
+    
+    # 写入数据
+    for r in records:
+        status_str = "成功" if r.status == 1 else "失败"
+        cw.writerow([
+            r.id, 
+            r.time.strftime('%Y-%m-%d %H:%M:%S'), 
+            r.plate_text, 
+            r.type, 
+            status_str, 
+            r.confidence, 
+            r.duration
+        ])
+    
+    # 创建响应
+    output = make_response(si.getvalue())
+    output.headers["Content-Disposition"] = "attachment; filename=history_records.csv"
+    output.headers["Content-type"] = "text/csv; charset=utf-8-sig" # utf-8-sig 兼容 Excel 打开中文
+    return output
 
 # --- 4. 辅助路由 ---
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    # 查询配置，如果不存在则创建一个默认的
+    config = SystemConfig.query.first()
+    if not config:
+        config = SystemConfig(confidence_threshold=85)
+        db.session.add(config)
+        db.session.commit()
+    
+    # 将 config 对象传递给模板
+    return render_template('index.html', config=config)
+
+@app.route('/api/settings/update', methods=['POST'])
+def update_settings():
+    try:
+        data = request.json
+        new_threshold = data.get('confidence_threshold')
+        
+        config = SystemConfig.query.first()
+        if config:
+            config.confidence_threshold = int(new_threshold)
+            db.session.commit()
+            return jsonify({'success': True})
+        else:
+            return jsonify({'error': 'Config not found'}), 404
+            
+    except Exception as e:
+        print(f"Settings Update Error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/performance')
 def performance():
@@ -414,6 +517,18 @@ def performance():
         'gpu_name': gpu_name
     })
 
+
+@app.route('/api/init/ocr')
+def init_ocr():
+    """ 前端加载完成后调用的预加载接口 """
+    try:
+        print("正在后台预加载 OCR 模型...")
+        get_ocr_model() # 调用懒加载函数
+        print("OCR 模型预加载完成！")
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"预加载失败: {e}")
+        return jsonify({'error': str(e)}), 500
 # --- 5. 启动程序 ---
 
 def start_flask():
@@ -430,9 +545,6 @@ if __name__ == '__main__':
     t = threading.Thread(target=start_flask)
     t.daemon = True
     t.start()
-    
-    # 预加载 OCR
-    get_ocr_model()
     
     icon_path = get_resource_path('apple-touch-icon.png')
     window = webview.create_window(

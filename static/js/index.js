@@ -31,6 +31,9 @@ const els = {
     // Buttons
     btnImage: document.getElementById('btn-image'),
     btnVideo: document.getElementById('btn-video'),
+    // [新增] 搜索和下载元素
+    searchInput: document.getElementById('history-search-input'),
+    btnDownload: document.getElementById('btn-download-history'),
 };
 
 // --- 5. 渲染逻辑 ---
@@ -68,7 +71,7 @@ function renderLogs() {
 `).join('');
 }
 
-// 渲染字符分割 (优化版)
+// 渲染字符分割 (修复：适配白天/黑夜模式)
 function renderSegmentation(plate) {
     if (!plate) {
         els.charContainer.innerHTML = `
@@ -83,17 +86,25 @@ function renderSegmentation(plate) {
         return;
     }
 
-    // 模拟每个字符的置信度 (因为OCR API返回的是整体置信度)
+    // 模拟每个字符的置信度
     const confidences = Array.from({ length: plate.length }, () => 90 + Math.random() * 9);
     
     els.charContainer.innerHTML = plate.split('').map((char, index) => `
     <div class="relative group flex-1 max-w-[110px] min-w-[50px] aspect-[3/4] animate-[slideIn_0.3s_ease-out_backwards]" style="animation-delay: ${index * 0.05}s; margin-bottom: 10px;">
-        <div class="w-full h-full rounded-xl bg-gradient-to-br from-gray-800 to-gray-900 border-2 border-cyan-500/50 flex items-center justify-center text-3xl sm:text-5xl lg:text-6xl font-bold shadow-lg shadow-cyan-500/20 transition-all duration-300 group-hover:scale-105 group-hover:-translate-y-2 group-hover:border-cyan-400 group-hover:shadow-cyan-400/40 cursor-default">
+        <div class="w-full h-full rounded-xl border-2 flex items-center justify-center text-3xl sm:text-5xl lg:text-6xl font-bold transition-all duration-300 cursor-default
+            bg-white border-gray-200 text-gray-800 shadow-lg shadow-gray-200/50
+            dark:bg-gradient-to-br dark:from-gray-800 dark:to-gray-900 dark:border-cyan-500/50 dark:text-gray-100 dark:shadow-cyan-500/20
+            
+            group-hover:scale-105 group-hover:-translate-y-2 
+            group-hover:border-cyan-500 dark:group-hover:border-cyan-400
+            group-hover:shadow-xl dark:group-hover:shadow-cyan-400/40">
             ${char}
         </div>
         
         <div class="absolute -bottom-8 left-1/2 -translate-x-1/2 w-full text-center opacity-70 group-hover:opacity-100 transition-opacity">
-            <span class="inline-block px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-xs sm:text-sm text-emerald-400 font-mono">
+            <span class="inline-block px-2 py-0.5 rounded-full text-xs sm:text-sm font-mono border
+                bg-emerald-50 text-emerald-600 border-emerald-200
+                dark:bg-emerald-500/10 dark:text-emerald-400 dark:border-emerald-500/20">
                 ${confidences[index].toFixed(1)}%
             </span>
         </div>
@@ -190,8 +201,15 @@ function updateDistribution() {
         .catch(console.error);
 }
 
-function updateHistoryAndStats() {
-    fetch('/api/stats/history')
+// 支持搜索参数
+function updateHistoryAndStats(searchQuery = "") {
+    // 构建 URL，如果有搜索关键词则附加参数
+    let url = '/api/stats/history';
+    if (searchQuery) {
+        url += `?search=${encodeURIComponent(searchQuery)}`;
+    }
+
+    fetch(url)
         .then(res => res.json())
         .then(data => {
             // 更新列表
@@ -204,6 +222,9 @@ function updateHistoryAndStats() {
                 if(els.statSuccess) els.statSuccess.innerText = data.stats.success;
                 if(els.statFailed) els.statFailed.innerText = data.stats.failed;
                 
+                // 更新平均用时
+                if(els.statTime) els.statTime.innerText = data.stats.avg_time + 's';
+
                 // 计算成功率
                 const rate = data.stats.total > 0 
                     ? ((data.stats.success / data.stats.total) * 100).toFixed(1) 
@@ -332,7 +353,7 @@ function startOcrRequest(cropFilename) {
                             : "text-2xl text-yellow-400 font-mono";
             }
             
-            // [新增] 显示识别用时
+            // 显示识别用时
             if (processTimeEl && data.duration) {
                 processTimeEl.innerText = data.duration;
             }
@@ -356,7 +377,7 @@ function startOcrRequest(cropFilename) {
     });
 }
 
-// 重置与模式切换逻辑 (保持不变)
+// 重置与模式切换逻辑
 window.resetImageUpload = function() {
     document.getElementById('image-upload').value = ""; 
     document.getElementById('image-upload-area').classList.remove('hidden');
@@ -365,7 +386,7 @@ window.resetImageUpload = function() {
     renderSegmentation(null);
 }
 
-// 其他辅助函数 (保持不变)
+// 其他辅助函数
 window.toggleSettings = function (show) {
     const modal = document.getElementById('settings-modal');
     show ? modal.classList.remove('hidden') : modal.classList.add('hidden');
@@ -392,7 +413,6 @@ function initTheme() {
 initTheme();
 
 window.switchVideoMode = function (mode) {
-    // 简化的切换逻辑
     const imgView = document.getElementById('image-view');
     const vidView = document.getElementById('video-view');
     const titleContainer = document.getElementById('mode-title-container');
@@ -422,12 +442,75 @@ window.switchVideoMode = function (mode) {
     lucide.createIcons();
 }
 
+// --- 事件绑定 ---
+
+// 1. 实时搜索功能
+if (els.searchInput) {
+    els.searchInput.addEventListener('input', function(e) {
+        const query = e.target.value.trim();
+        // 调用更新函数，传入搜索词
+        updateHistoryAndStats(query);
+    });
+}
+
+// 2. 历史记录下载功能
+if (els.btnDownload) {
+    els.btnDownload.addEventListener('click', function() {
+        window.location.href = '/api/download/history';
+    });
+}
+
 // --- 初始化调用 ---
-// [新增] 页面加载时刷新一次数据
 updateTrend();
 updateDistribution();
 updateHistoryAndStats();
 updatePerformance();
 
-// [修改] 启用定时刷新
+// 启用定时刷新
 setInterval(updatePerformance, 2000);
+fetch('/api/init/ocr')
+    .then(res => res.json())
+    .then(data => {
+        if(data.success) {
+            console.log("OCR 模型后台预加载完成");
+        }
+    })
+    .catch(console.error);
+
+
+
+const confInput = document.getElementById('conf-threshold-input');
+const confDisplay = document.getElementById('conf-threshold-display');
+
+if (confInput && confDisplay) {
+    confInput.addEventListener('input', function(e) {
+        // 实时更新右侧数字
+        confDisplay.innerText = e.target.value + '%';
+    });
+}
+
+// 2. 保存设置函数
+window.saveSettings = function() {
+    const val = document.getElementById('conf-threshold-input').value;
+    
+    fetch('/api/settings/update', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ confidence_threshold: val })
+    })
+    .then(res => res.json())
+    .then(data => {
+        if (data.success) {
+            // 保存成功后关闭弹窗
+            toggleSettings(false);
+        } else {
+            alert("保存失败：" + data.error);
+        }
+    })
+    .catch(err => {
+        console.error(err);
+        alert("网络请求失败");
+    });
+}
