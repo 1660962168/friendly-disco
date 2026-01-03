@@ -2,38 +2,42 @@ import webview
 import threading
 import sys
 import os
+
+# --- [优化] 跳过 PaddleOCR 的联网检查，极大加快启动速度 ---
+os.environ['DISABLE_MODEL_SOURCE_CHECK'] = 'True' 
+
 import glob
-from flask import Flask, render_template, jsonify, request, url_for,make_response
+from flask import Flask, render_template, jsonify, request, url_for, Response, stream_with_context, make_response
 import psutil
 import GPUtil
 from ultralytics import YOLO
 import cv2
+import numpy as np
 import uuid
 import pathlib
 import re
 import config
-import time  # [新增] 导入 time 模块
+import time
+import csv
+import io
+from datetime import datetime
 from exts import db
 from models import *
 from flask_migrate import Migrate
-os.environ['DISABLE_MODEL_SOURCE_CHECK'] = 'True'
 from paddleocr import PaddleOCR
 import traceback
 from sqlalchemy import func
-import csv
-import io
 
 # --- 1. 全局配置与初始化 ---
 
-# 初始化 PaddleOCR
 ocr_engine = None 
-
 
 def get_ocr_model():
     """ 懒加载 OCR 模型单例模式 """
     global ocr_engine
     if ocr_engine is None:
         print("正在初始化 OCR 模型 (第一次运行会稍慢)...")
+        # 显式指定模型路径或名称，确保 det 和 rec 都加载
         ocr_engine = PaddleOCR(
             text_detection_model_name="PP-OCRv5_server_det",
             text_recognition_model_name="PP-OCRv5_server_rec",
@@ -95,6 +99,19 @@ except Exception as e:
 # 定义全局变量
 CURRENT_DETECTED_CLASS = None 
 
+# --- 3. 核心 API 路由 ---
+
+@app.route('/api/init/ocr')
+def init_ocr():
+    try:
+        print("正在后台预加载 OCR 模型...")
+        get_ocr_model() 
+        print("OCR 模型预加载完成！")
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"预加载失败: {e}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/detect/yolo', methods=['POST'])
 def detect_yolo():
     global CURRENT_DETECTED_CLASS
@@ -119,18 +136,15 @@ def detect_yolo():
         filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
         file.save(filepath)
 
-        # --- [新增] 获取数据库置信度阈值 ---
-        conf_threshold = 0.25  # 默认值，防止数据库读取失败
+        conf_threshold = 0.25
         try:
             sys_config = SystemConfig.query.first()
             if sys_config:
-                # 数据库存的是 0-100 的整数，YOLO 需要 0.0-1.0 的浮点数
                 conf_threshold = sys_config.confidence_threshold / 100.0
                 print(f"使用置信度阈值: {conf_threshold}")
-        except Exception as e:
-            print(f"读取配置失败，使用默认阈值: {e}")
+        except:
+            pass
 
-        # --- [修改] 将阈值传入模型 ---
         results = model(filepath, conf=conf_threshold)
         result = results[0]
         
@@ -156,7 +170,6 @@ def detect_yolo():
             class_id = int(cls_ids[0])
             class_name = result.names[class_id]
             CURRENT_DETECTED_CLASS = class_name
-            print(f"全局变量已更新: {CURRENT_DETECTED_CLASS}")
             
             padding_x, padding_y = 10, 10
             x1 = int(box[0]) - padding_x
@@ -194,9 +207,7 @@ def detect_yolo():
     
 @app.route('/api/detect/ocr', methods=['POST'])
 def detect_ocr():
-    # [新增] 开始计时
     start_time = time.time()
-
     data = request.json
     crop_filename = data.get('crop_filename')
     
@@ -211,11 +222,8 @@ def detect_ocr():
     plate_confidence = 0.0
 
     try:
-        # 获取 OCR 模型
         ocr = get_ocr_model()
-
         plate_crop = cv2.imread(crop_path)
-        
         # 图像增强
         roi = cv2.resize(plate_crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -226,21 +234,26 @@ def detect_ocr():
         PROVINCES = "京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领"
         candidates = []
 
+        # 图片上传模式，背景复杂，使用默认的 ocr.ocr(det=True) 或者 predict
+        # 为了兼容性，这里使用 ocr.ocr(det=False) 因为我们已经有 crop 了
+        # 但如果是用户手动上传的很乱的 crop，可能需要 det=True
+        # 这里保持之前的逻辑（predict 或 ocr），但建议统一用 ocr
+        
         for img_input, label in [(gray_bgr, "Normal"), (gray_inv_bgr, "Inverted")]:
-            res = ocr.predict(img_input)
+            # [修改] 使用标准的 ocr 接口，关闭检测，只做识别
+            res = ocr.ocr(img_input, det=False, rec=True, cls=False)
             
             text_res = ""
             score_res = 0.0
             
-            if res:
-                if isinstance(res, list) and len(res) > 0:
-                    item = res[0]
-                    if isinstance(item, dict) and 'rec_texts' in item and len(item['rec_texts']) > 0:
-                        text_res = item['rec_texts'][0]
-                        score_res = float(item['rec_scores'][0])
-                    elif isinstance(item, list) and len(item) >= 2:
-                        text_res = item[1][0]
-                        score_res = float(item[1][1])
+            # 解析 det=False 的结果: [[('文本', 0.99)]]
+            if res and isinstance(res, list):
+                for item in res:
+                    if isinstance(item, list) and len(item) >= 1:
+                        # item 是 [('text', score)]
+                        if isinstance(item[0], tuple) or isinstance(item[0], list):
+                            text_res = item[0][0]
+                            score_res = float(item[0][1])
             
             if text_res:
                 clean_text = re.sub(r'[^\u4e00-\u9fa5A-Z0-9]', '', text_res)
@@ -251,11 +264,9 @@ def detect_ocr():
                     current_score += 0.5
                 if label == "Inverted" and is_valid:
                     current_score += 0.2
-                
                 if len(clean_text) > 1:
-                    candidates.append({'text': clean_text, 'score': current_score, 'valid': is_valid, 'mode': label})
+                    candidates.append({'text': clean_text, 'score': current_score, 'valid': is_valid})
 
-        # [新增] 结束计时
         end_time = time.time()
         duration = round(end_time - start_time, 2)
 
@@ -265,31 +276,21 @@ def detect_ocr():
             plate_text = best['text']
             plate_confidence = min(0.99, best['score'])
             
-            print(f"OCR Success: {plate_text}")
             global CURRENT_DETECTED_CLASS
             plate_type = CURRENT_DETECTED_CLASS if CURRENT_DETECTED_CLASS else "Unknown"
+            status = 1 if (len(plate_text) == 7 or len(plate_text) == 8) else 0
             
-            status = 1
-            if len(plate_text) != 7 and len(plate_text) != 8:
-                 status = 0
-            
-            # --- [核心修改部分] 开始 ---
+            # 数据库逻辑
             try:
-                # 1. 先查询数据库里有没有这个车牌
                 existing_record = LicensePlate.query.filter_by(plate_text=plate_text).first()
-                
                 if existing_record:
-                    # 2. 如果有：更新它的时间和其他信息
-                    existing_record.time = datetime.now() # 刷新时间到当前
+                    existing_record.time = datetime.now()
                     existing_record.type = plate_type
                     existing_record.status = status
                     existing_record.confidence = plate_confidence
                     existing_record.duration = duration
-                    
                     db.session.commit()
-                    print(f"已更新旧记录: {plate_text} -> 时间已刷新")
                 else:
-                    # 3. 如果没有：插入新记录
                     record = LicensePlate(
                         plate_text=plate_text,
                         type=plate_type,
@@ -299,15 +300,9 @@ def detect_ocr():
                     )
                     db.session.add(record)
                     db.session.commit()
-                    print(f"已插入新记录: {plate_text}")
-
             except Exception as db_e:
-                print(f"Database Error: {db_e}")
+                print(f"DB Save Error: {db_e}")
                 db.session.rollback()
-            # --- [核心修改部分] 结束 ---
-
-        else:
-            print("OCR Failed to find valid text")
 
         return jsonify({
             'success': True,
@@ -321,26 +316,173 @@ def detect_ocr():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-# --- [新增] 统计与渲染专用路由 ---
+# --- 视频识别模块 (深度修复版) ---
+
+@app.route('/api/detect/video_upload', methods=['POST'])
+def detect_video_upload():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+
+    try:
+        cleanup_old_files(UPLOAD_FOLDER, limit=10)
+        ext = os.path.splitext(file.filename)[1]
+        safe_filename = f"video_{uuid.uuid4().hex}{ext}"
+        filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
+        file.save(filepath)
+
+        return jsonify({
+            'success': True,
+            'video_filename': safe_filename,
+            'stream_url': url_for('video_feed', filename=safe_filename)
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# [核心修复函数] 视频流生成
+def generate_video_frames(video_path):
+    conf_threshold = 0.25
+    with app.app_context():
+        try:
+            sys_config = SystemConfig.query.first()
+            if sys_config:
+                conf_threshold = sys_config.confidence_threshold / 100.0
+        except:
+            pass
+
+    cap = cv2.VideoCapture(video_path)
+    ocr = get_ocr_model()
+    PROVINCES = "京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领"
+
+    # OCR 辅助函数：处理单张小图
+    def recognize_plate(img_crop):
+        # 1. 预处理
+        roi = cv2.resize(img_crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        
+        candidates = []
+        
+        # 2. 尝试正色 (gray_bgr) 和 反色 (gray_inv_bgr)
+        # 视频流为了速度，可以只做一次，但为了准确率，建议做两次尝试
+        gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        gray_inv = cv2.bitwise_not(gray)
+        gray_inv_bgr = cv2.cvtColor(gray_inv, cv2.COLOR_GRAY2BGR)
+        
+        for input_img in [gray_bgr, gray_inv_bgr]:
+            try:
+                # [关键] det=False 强制关闭检测，只做识别
+                res = ocr.ocr(input_img, det=False, rec=True, cls=False)
+                
+                # 解析结果: [[('苏E05EV9', 0.99)]]
+                if res and isinstance(res, list):
+                    for item in res:
+                        if isinstance(item, list) and len(item) >= 1:
+                            text_data = item[0] # ('text', score)
+                            if isinstance(text_data, tuple) or isinstance(text_data, list):
+                                text = text_data[0]
+                                score = float(text_data[1])
+                                
+                                # 简单清洗
+                                clean = re.sub(r'[^\u4e00-\u9fa5A-Z0-9]', '', text)
+                                if len(clean) >= 7 and clean[0] in PROVINCES:
+                                    candidates.append((clean, score))
+            except Exception:
+                pass
+        
+        if candidates:
+            # 返回置信度最高的
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            return candidates[0] # (text, score)
+        
+        return None, 0.0
+
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            break
+            
+        # YOLO 检测
+        results = model(frame, conf=conf_threshold, verbose=False)
+        annotated_frame = frame.copy()
+        
+        for result in results:
+            boxes = result.boxes
+            for box in boxes:
+                # 获取坐标
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cls_id = int(box.cls[0])
+                cls_name = result.names[cls_id]
+                
+                # 绘制绿色框
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                
+                # 裁剪车牌区域
+                h, w, _ = frame.shape
+                # 稍微扩大一点点，防止贴边
+                pad = 5
+                crop_x1, crop_y1 = max(0, x1 - pad), max(0, y1 - pad)
+                crop_x2, crop_y2 = min(w, x2 + pad), min(h, y2 + pad)
+                plate_crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+                
+                # OCR 识别
+                text, score = recognize_plate(plate_crop)
+                
+                if text:
+                    # 数据库操作 (在 app context 中)
+                    with app.app_context():
+                        try:
+                            existing = LicensePlate.query.filter_by(plate_text=text).first()
+                            if existing:
+                                existing.time = datetime.now()
+                                existing.confidence = score
+                                existing.status = 1
+                                db.session.commit()
+                            else:
+                                new_plate = LicensePlate(
+                                    plate_text=text,
+                                    type=cls_name,
+                                    status=1,
+                                    confidence=score,
+                                    duration=0.1 # 视频流模拟耗时
+                                )
+                                db.session.add(new_plate)
+                                db.session.commit()
+                        except:
+                            db.session.rollback()
+                    
+                    # 绘制文字 (注意：cv2 不支持中文，这里用 ASCII 字符代替或简单绘制)
+                    # 为了避免乱码，只绘制 "Plate Found" 或 英文部分，前端列表会显示中文
+                    # 这里做一个简单的处理：尝试绘制，如果是乱码也不影响程序运行
+                    display_text = f"Conf: {score:.2f}" 
+                    cv2.putText(annotated_frame, display_text, (x1, y1 - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        # 编码图片推流
+        ret, buffer = cv2.imencode('.jpg', annotated_frame)
+        frame_bytes = buffer.tobytes()
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+    cap.release()
+
+@app.route('/video_feed/<filename>')
+def video_feed(filename):
+    video_path = os.path.join(UPLOAD_FOLDER, filename)
+    if not os.path.exists(video_path):
+        return "Video not found", 404
+    return Response(stream_with_context(generate_video_frames(video_path)),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+# --- 统计 API (保持不变) ---
 
 @app.route('/api/stats/trend')
 def stats_trend():
-    """ 24小时识别趋势 """
-    # 获取所有的记录的时间
-    # 既然要做24小时趋势，这里简单起见统计所有历史记录的小时分布
-    # 如果要仅限“今日”，可以在 query 中加 filter
-    
-    # 1. 查询所有记录的时间
     records = db.session.query(LicensePlate.time).all()
-    
-    # 2. Python 处理统计
     hours_count = {i: 0 for i in range(24)}
-    
     for r in records:
         if r.time:
-            h = r.time.hour
-            hours_count[h] += 1
-            
+            hours_count[r.time.hour] += 1
     return jsonify({
         'labels': [f"{i:02d}:00" for i in range(24)],
         'data': [hours_count[i] for i in range(24)]
@@ -348,189 +490,96 @@ def stats_trend():
 
 @app.route('/api/stats/distribution')
 def stats_distribution():
-    """ 车牌类型分布 """
-    # 按类型分组计数
-    results = db.session.query(
-        LicensePlate.type, 
-        func.count(LicensePlate.id)
-    ).group_by(LicensePlate.type).all()
-    
-    # 映射表
-    label_map = {
-        'BlueCard': '蓝牌',
-        'GreenCard': '绿牌',
-        'YellowCard': '黄牌',
-        'Unknown': '未知'
-    }
-    color_map = {
-        'BlueCard': '#3b82f6',   # blue-500
-        'GreenCard': '#10b981',  # emerald-500
-        'YellowCard': '#eab308', # yellow-500
-        'Unknown': '#9ca3af'     # gray-400
-    }
-    
-    labels = []
-    data = []
-    colors = []
-    
-    for type_name, count in results:
-        labels.append(label_map.get(type_name, type_name))
-        data.append(count)
-        colors.append(color_map.get(type_name, '#9ca3af'))
-        
+    results = db.session.query(LicensePlate.type, func.count(LicensePlate.id)).group_by(LicensePlate.type).all()
+    label_map = {'BlueCard': '蓝牌', 'GreenCard': '绿牌', 'YellowCard': '黄牌', 'Unknown': '未知'}
+    color_map = {'BlueCard': '#3b82f6', 'GreenCard': '#10b981', 'YellowCard': '#eab308', 'Unknown': '#9ca3af'}
     return jsonify({
-        'labels': labels,
-        'data': data,
-        'colors': colors
+        'labels': [label_map.get(r[0], r[0]) for r in results],
+        'data': [r[1] for r in results],
+        'colors': [color_map.get(r[0], '#9ca3af') for r in results]
     })
 
 @app.route('/api/stats/history')
 def stats_history():
-    """ 历史记录 (全部数据，支持搜索) & 全局统计 """
-    # 1. 获取搜索参数
     search_query = request.args.get('search', '').strip()
-    
-    # 2. 构建日志查询 (Logs Query) - 仅影响列表显示
     log_query = LicensePlate.query
     if search_query:
         log_query = log_query.filter(LicensePlate.plate_text.contains(search_query))
     
-    # [修改点] 获取过滤后的“全部”数据，按时间倒序排列 (去掉了 .limit(20))
     logs = log_query.order_by(LicensePlate.time.desc()).all()
     
     history_data = []
     for log in logs:
         history_data.append({
             'id': log.id,
-            # 格式化时间，包含年月日以便查看历史
             'time': log.time.strftime('%Y-%m-%d %H:%M:%S'),
             'plate': log.plate_text,
             'status': 'success' if log.status == 1 else 'failed',
             'confidence': round(log.confidence * 100, 1) if log.confidence else 0,
-            'location': '默认入口',
             'duration': log.duration
         })
         
-    # 3. 构建全局统计 (Global Stats) - 不受搜索影响，反映系统整体状况
-    total_count = LicensePlate.query.count()
-    success_count = LicensePlate.query.filter_by(status=1).count()
-    failed_count = LicensePlate.query.filter_by(status=0).count()
-    
-    # 计算平均用时
     avg_duration = db.session.query(func.avg(LicensePlate.duration)).scalar()
     avg_duration = round(avg_duration, 2) if avg_duration else 0.00
     
     return jsonify({
         'logs': history_data,
         'stats': {
-            'total': total_count,
-            'success': success_count,
-            'failed': failed_count,
-            'avg_time': avg_duration  # 返回平均用时
+            'total': LicensePlate.query.count(),
+            'success': LicensePlate.query.filter_by(status=1).count(),
+            'failed': LicensePlate.query.filter_by(status=0).count(),
+            'avg_time': avg_duration
         }
     })
 
 @app.route('/api/download/history')
 def download_history():
-    """ 导出所有历史记录为 CSV """
-    # 查询所有数据，按时间倒序
     records = LicensePlate.query.order_by(LicensePlate.time.desc()).all()
-    
-    # 使用 StringIO 在内存中构建 CSV
     si = io.StringIO()
     cw = csv.writer(si)
-    
-    # 写入表头
     cw.writerow(['ID', '时间', '车牌号', '车辆类型', '识别状态', '置信度', '识别耗时(秒)'])
-    
-    # 写入数据
     for r in records:
-        status_str = "成功" if r.status == 1 else "失败"
-        cw.writerow([
-            r.id, 
-            r.time.strftime('%Y-%m-%d %H:%M:%S'), 
-            r.plate_text, 
-            r.type, 
-            status_str, 
-            r.confidence, 
-            r.duration
-        ])
-    
-    # 创建响应
+        cw.writerow([r.id, r.time.strftime('%Y-%m-%d %H:%M:%S'), r.plate_text, r.type, 
+                     "成功" if r.status==1 else "失败", r.confidence, r.duration])
     output = make_response(si.getvalue())
     output.headers["Content-Disposition"] = "attachment; filename=history_records.csv"
-    output.headers["Content-type"] = "text/csv; charset=utf-8-sig" # utf-8-sig 兼容 Excel 打开中文
+    output.headers["Content-type"] = "text/csv; charset=utf-8-sig"
     return output
-
-# --- 4. 辅助路由 ---
-
-@app.route('/')
-def index():
-    # 查询配置，如果不存在则创建一个默认的
-    config = SystemConfig.query.first()
-    if not config:
-        config = SystemConfig(confidence_threshold=85)
-        db.session.add(config)
-        db.session.commit()
-    
-    # 将 config 对象传递给模板
-    return render_template('index.html', config=config)
 
 @app.route('/api/settings/update', methods=['POST'])
 def update_settings():
     try:
         data = request.json
-        new_threshold = data.get('confidence_threshold')
-        
         config = SystemConfig.query.first()
         if config:
-            config.confidence_threshold = int(new_threshold)
+            config.confidence_threshold = int(data.get('confidence_threshold'))
             db.session.commit()
             return jsonify({'success': True})
-        else:
-            return jsonify({'error': 'Config not found'}), 404
-            
+        return jsonify({'error': 'Config not found'}), 404
     except Exception as e:
-        print(f"Settings Update Error: {e}")
         return jsonify({'error': str(e)}), 500
+
+@app.route('/')
+def index():
+    config = SystemConfig.query.first()
+    if not config:
+        config = SystemConfig(confidence_threshold=85)
+        db.session.add(config)
+        db.session.commit()
+    return render_template('index.html', config=config)
 
 @app.route('/api/performance')
 def performance():
-    cpu_usage = psutil.cpu_percent(interval=None)
-    memory_info = psutil.virtual_memory()
-    memory_usage = memory_info.percent
-    gpu_usage = 0
-    gpu_name = "No GPU"
+    cpu = psutil.cpu_percent(interval=None)
+    mem = psutil.virtual_memory().percent
+    gpu = 0
     try:
         gpus = GPUtil.getGPUs()
-        if gpus:
-            gpu = gpus[0]
-            gpu_usage = gpu.load * 100
-            gpu_name = gpu.name
-    except:
-        pass
+        if gpus: gpu = gpus[0].load * 100
+    except: pass
+    return jsonify({'cpu_usage': round(cpu, 1), 'memory_usage': round(mem, 1), 'gpu_usage': round(gpu, 1)})
 
-    return jsonify({
-        'cpu_usage': round(cpu_usage, 1),
-        'memory_usage': round(memory_usage, 1),
-        'gpu_usage': round(gpu_usage, 1),
-        'gpu_name': gpu_name
-    })
-
-
-@app.route('/api/init/ocr')
-def init_ocr():
-    """ 前端加载完成后调用的预加载接口 """
-    try:
-        print("正在后台预加载 OCR 模型...")
-        get_ocr_model() # 调用懒加载函数
-        print("OCR 模型预加载完成！")
-        return jsonify({'success': True})
-    except Exception as e:
-        print(f"预加载失败: {e}")
-        return jsonify({'error': str(e)}), 500
-# --- 5. 启动程序 ---
-
+# --- 启动 ---
 def start_flask():
     app.run(host='127.0.0.1', port=5000, threaded=True, use_reloader=False)
 
@@ -538,9 +587,7 @@ if __name__ == '__main__':
     with app.app_context():
         try:
             db.create_all()
-            print("数据库表检查完成。")
-        except Exception as e:
-            print(f"数据库警告: {e}")
+        except: pass
 
     t = threading.Thread(target=start_flask)
     t.daemon = True
@@ -550,9 +597,7 @@ if __name__ == '__main__':
     window = webview.create_window(
         title="车牌识别系统",
         url='http://127.0.0.1:5000',
-        width=1480, 
-        height=900,
-        resizable=True,
-        confirm_close=True,
+        width=1480, height=900,
+        resizable=True, confirm_close=True
     )
     webview.start(icon=icon_path)
