@@ -94,10 +94,20 @@ except Exception as e:
     print(f"模型加载失败 (请确保 weights/best.pt 存在): {e}")
     model = None
 
+import os
+import uuid
+import cv2
+from flask import jsonify, request, url_for
 
-# --- 3. 核心路由 ---
+# 1. 定义全局变量 (在所有路由之外)
+# 这里的变量可以被其他路由访问
+CURRENT_DETECTED_CLASS = None 
+
 @app.route('/api/detect/yolo', methods=['POST'])
 def detect_yolo():
+    # 引入全局变量，以便在函数内修改它
+    global CURRENT_DETECTED_CLASS
+    
     if not model:
         return jsonify({'error': 'Model not loaded'}), 500
     if 'file' not in request.files:
@@ -129,16 +139,26 @@ def detect_yolo():
 
         boxes = result.boxes.xyxy.cpu().numpy()
         conf_scores = result.boxes.conf.cpu().numpy()
+        # 获取类别索引数组
+        cls_ids = result.boxes.cls.cpu().numpy() 
         
         has_plate = False
         crop_filename = ""
         yolo_confidence = 0.0
+        
+        # 重置当前全局变量，防止如果没有检测到物体时保留了上一次的值
+        CURRENT_DETECTED_CLASS = None 
 
         if len(boxes) > 0:
             box = boxes[0]
             yolo_confidence = float(conf_scores[0])
             
-            # Padding (保持之前的优化)
+            # 2. 获取并设置类型名称
+            class_id = int(cls_ids[0])       # 获取第一个框的类别ID (例如 0, 1)
+            class_name = result.names[class_id] # 通过ID在names字典中查找名称 (例如 'blue_plate')
+            # === 设置全局变量 ===
+            CURRENT_DETECTED_CLASS = class_name
+            print(f"全局变量已更新: {CURRENT_DETECTED_CLASS}")
             padding_x, padding_y = 10, 10
             x1 = int(box[0]) - padding_x
             y1 = int(box[1]) - padding_y
@@ -159,13 +179,13 @@ def detect_yolo():
             
             has_plate = True
 
-        # [修改] 这里不再跑 OCR，只返回图片路径给前端
         return jsonify({
             'success': True,
             'original_url': url_for('static', filename=f'uploads/{safe_filename}'),
             'result_url': url_for('static', filename=f'results/{result_filename}'),
             'has_plate': has_plate,
-            'crop_filename': crop_filename if has_plate else None, # 传文件名给前端，用于下一步请求
+            'detected_type': CURRENT_DETECTED_CLASS, # 将识别到的类型也返回给前端
+            'crop_filename': crop_filename if has_plate else None,
             'crop_url': url_for('static', filename=f'crops/{crop_filename}') if has_plate else None,
             'yolo_confidence': yolo_confidence
         })
@@ -173,6 +193,7 @@ def detect_yolo():
     except Exception as e:
         print(f"YOLO Error: {e}")
         return jsonify({'error': str(e)}), 500
+    
 @app.route('/api/detect/ocr', methods=['POST'])
 def detect_ocr():
     # 获取前端传来的裁剪文件名
@@ -242,6 +263,24 @@ def detect_ocr():
             plate_text = best['text']
             plate_confidence = min(0.99, best['score'])
             print(f"OCR Success: {plate_text}")
+            global CURRENT_DETECTED_CLASS
+            plate_type = CURRENT_DETECTED_CLASS
+            if len(plate_text) != 7 and len(plate_text) != 8:
+                print("OCR Detected text length is invalid")
+                record = LicensePlate(
+                    plate_text=plate_text,
+                    type=plate_type,
+                    status=0,
+                    )
+            else:
+                print("OCR Detected text length is valid")
+                record = LicensePlate(
+                    plate_text=plate_text,
+                    type=plate_type,
+                    status=1,
+                    )
+            db.session.add(record)
+            db.session.commit()
         else:
             print("OCR Failed to find valid text")
 
