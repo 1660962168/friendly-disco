@@ -13,17 +13,17 @@ import uuid
 import pathlib
 import re
 import config
+import time  # [新增] 导入 time 模块
 from exts import db
 from models import *
 from flask_migrate import Migrate
 from paddleocr import PaddleOCR
 import traceback
+from sqlalchemy import func
 
 # --- 1. 全局配置与初始化 ---
 
 # 初始化 PaddleOCR
-# use_textline_orientation=False: 关闭方向检测，防止车牌被误判旋转
-# lang="ch": 支持中英文
 ocr_engine = None 
 
 def get_ocr_model():
@@ -31,7 +31,6 @@ def get_ocr_model():
     global ocr_engine
     if ocr_engine is None:
         print("正在初始化 OCR 模型 (第一次运行会稍慢)...")
-        # 关掉 show_log 防止报错，关掉方向检测
         ocr_engine = PaddleOCR(
             text_detection_model_name="PP-OCRv5_server_det",
             text_recognition_model_name="PP-OCRv5_server_rec",
@@ -41,7 +40,6 @@ def get_ocr_model():
     return ocr_engine
 
 def get_resource_path(relative_path):
-    """ 获取资源绝对路径（兼容 PyInstaller 打包） """
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
@@ -60,19 +58,17 @@ UPLOAD_FOLDER = os.path.join(BASE_DIR, 'static', 'uploads')
 RESULTS_FOLDER = os.path.join(BASE_DIR, 'static', 'results')
 CROPS_FOLDER = os.path.join(BASE_DIR, 'static', 'crops')
 
-# 确保文件夹存在
 for folder in [UPLOAD_FOLDER, RESULTS_FOLDER, CROPS_FOLDER]:
     os.makedirs(folder, exist_ok=True)
 
 # --- 2. 辅助函数 ---
 
 def cleanup_old_files(folder_path, limit=30):
-    """ 清理旧文件，防止磁盘占满 """
     try:
         files = glob.glob(os.path.join(folder_path, "*"))
         files = [f for f in files if os.path.isfile(f)]
         if len(files) > limit:
-            files.sort(key=os.path.getmtime) # 按时间排序
+            files.sort(key=os.path.getmtime)
             num_to_delete = len(files) - limit
             for i in range(num_to_delete):
                 try:
@@ -85,7 +81,6 @@ def cleanup_old_files(folder_path, limit=30):
 # 加载 YOLO 模型
 try:
     print(f"正在加载模型: {MODEL_PATH}")
-    # [Windows 路径兼容修复]
     if os.name == 'nt':
         pathlib.PosixPath = pathlib.WindowsPath
     model = YOLO(MODEL_PATH)
@@ -94,18 +89,11 @@ except Exception as e:
     print(f"模型加载失败 (请确保 weights/best.pt 存在): {e}")
     model = None
 
-import os
-import uuid
-import cv2
-from flask import jsonify, request, url_for
-
-# 1. 定义全局变量 (在所有路由之外)
-# 这里的变量可以被其他路由访问
+# 定义全局变量
 CURRENT_DETECTED_CLASS = None 
 
 @app.route('/api/detect/yolo', methods=['POST'])
 def detect_yolo():
-    # 引入全局变量，以便在函数内修改它
     global CURRENT_DETECTED_CLASS
     
     if not model:
@@ -128,7 +116,6 @@ def detect_yolo():
         filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
         file.save(filepath)
 
-        # YOLO 推理
         results = model(filepath)
         result = results[0]
         
@@ -139,26 +126,23 @@ def detect_yolo():
 
         boxes = result.boxes.xyxy.cpu().numpy()
         conf_scores = result.boxes.conf.cpu().numpy()
-        # 获取类别索引数组
         cls_ids = result.boxes.cls.cpu().numpy() 
         
         has_plate = False
         crop_filename = ""
         yolo_confidence = 0.0
         
-        # 重置当前全局变量，防止如果没有检测到物体时保留了上一次的值
         CURRENT_DETECTED_CLASS = None 
 
         if len(boxes) > 0:
             box = boxes[0]
             yolo_confidence = float(conf_scores[0])
             
-            # 2. 获取并设置类型名称
-            class_id = int(cls_ids[0])       # 获取第一个框的类别ID (例如 0, 1)
-            class_name = result.names[class_id] # 通过ID在names字典中查找名称 (例如 'blue_plate')
-            # === 设置全局变量 ===
+            class_id = int(cls_ids[0])
+            class_name = result.names[class_id]
             CURRENT_DETECTED_CLASS = class_name
             print(f"全局变量已更新: {CURRENT_DETECTED_CLASS}")
+            
             padding_x, padding_y = 10, 10
             x1 = int(box[0]) - padding_x
             y1 = int(box[1]) - padding_y
@@ -172,7 +156,6 @@ def detect_yolo():
             
             plate_crop = original_img[y1:y2, x1:x2]
             
-            # 保存裁剪图 (OCR 将读取这个文件)
             crop_filename = f"crop_{safe_filename}"
             crop_path = os.path.join(CROPS_FOLDER, crop_filename)
             cv2.imwrite(crop_path, plate_crop)
@@ -184,7 +167,7 @@ def detect_yolo():
             'original_url': url_for('static', filename=f'uploads/{safe_filename}'),
             'result_url': url_for('static', filename=f'results/{result_filename}'),
             'has_plate': has_plate,
-            'detected_type': CURRENT_DETECTED_CLASS, # 将识别到的类型也返回给前端
+            'detected_type': CURRENT_DETECTED_CLASS,
             'crop_filename': crop_filename if has_plate else None,
             'crop_url': url_for('static', filename=f'crops/{crop_filename}') if has_plate else None,
             'yolo_confidence': yolo_confidence
@@ -196,7 +179,9 @@ def detect_yolo():
     
 @app.route('/api/detect/ocr', methods=['POST'])
 def detect_ocr():
-    # 获取前端传来的裁剪文件名
+    # [新增] 开始计时
+    start_time = time.time()
+
     data = request.json
     crop_filename = data.get('crop_filename')
     
@@ -211,13 +196,12 @@ def detect_ocr():
     plate_confidence = 0.0
 
     try:
-        # [优化] 获取懒加载的 OCR 模型
-        
+        # [修改] 修复 OCR 模型调用
+        ocr = get_ocr_model()
 
-        # 读取图片
         plate_crop = cv2.imread(crop_path)
         
-        # === 之前的 OCR 增强逻辑 (放大/灰度/反色) ===
+        # 图像增强
         roi = cv2.resize(plate_crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         gray_inv = cv2.bitwise_not(gray)
@@ -227,7 +211,6 @@ def detect_ocr():
         PROVINCES = "京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领"
         candidates = []
 
-        # 双向识别
         for img_input, label in [(gray_bgr, "Normal"), (gray_inv_bgr, "Inverted")]:
             res = ocr.predict(img_input)
             
@@ -257,37 +240,49 @@ def detect_ocr():
                 if len(clean_text) > 1:
                     candidates.append({'text': clean_text, 'score': current_score, 'valid': is_valid, 'mode': label})
 
+        # [新增] 结束计时
+        end_time = time.time()
+        duration = round(end_time - start_time, 2)
+
         if candidates:
             candidates.sort(key=lambda x: (x['valid'], x['score']), reverse=True)
             best = candidates[0]
             plate_text = best['text']
             plate_confidence = min(0.99, best['score'])
+            
             print(f"OCR Success: {plate_text}")
             global CURRENT_DETECTED_CLASS
-            plate_type = CURRENT_DETECTED_CLASS
+            plate_type = CURRENT_DETECTED_CLASS if CURRENT_DETECTED_CLASS else "Unknown"
+            
+            status = 1
             if len(plate_text) != 7 and len(plate_text) != 8:
-                print("OCR Detected text length is invalid")
+                 status = 0
+            
+            # [修改] 存入数据库，包含 duration 和 confidence
+            try:
+                # 先查询是否存在相同的车牌，如果存在则更新，不存在则插入
+                # 为了演示简单，这里直接插入，如果报错(Unique constraint)则忽略或打印
                 record = LicensePlate(
                     plate_text=plate_text,
                     type=plate_type,
-                    status=0,
-                    )
-            else:
-                print("OCR Detected text length is valid")
-                record = LicensePlate(
-                    plate_text=plate_text,
-                    type=plate_type,
-                    status=1,
-                    )
-            db.session.add(record)
-            db.session.commit()
+                    status=status,
+                    confidence=plate_confidence,
+                    duration=duration
+                )
+                db.session.add(record)
+                db.session.commit()
+            except Exception as db_e:
+                print(f"Database Save Error (Might be duplicate): {db_e}")
+                db.session.rollback()
+
         else:
             print("OCR Failed to find valid text")
 
         return jsonify({
             'success': True,
             'plate_text': plate_text,
-            'confidence': plate_confidence
+            'confidence': plate_confidence,
+            'duration': duration  # [新增] 返回用时
         })
 
     except Exception as e:
@@ -295,6 +290,100 @@ def detect_ocr():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+# --- [新增] 统计与渲染专用路由 ---
+
+@app.route('/api/stats/trend')
+def stats_trend():
+    """ 24小时识别趋势 """
+    # 获取所有的记录的时间
+    # 既然要做24小时趋势，这里简单起见统计所有历史记录的小时分布
+    # 如果要仅限“今日”，可以在 query 中加 filter
+    
+    # 1. 查询所有记录的时间
+    records = db.session.query(LicensePlate.time).all()
+    
+    # 2. Python 处理统计
+    hours_count = {i: 0 for i in range(24)}
+    
+    for r in records:
+        if r.time:
+            h = r.time.hour
+            hours_count[h] += 1
+            
+    return jsonify({
+        'labels': [f"{i:02d}:00" for i in range(24)],
+        'data': [hours_count[i] for i in range(24)]
+    })
+
+@app.route('/api/stats/distribution')
+def stats_distribution():
+    """ 车牌类型分布 """
+    # 按类型分组计数
+    results = db.session.query(
+        LicensePlate.type, 
+        func.count(LicensePlate.id)
+    ).group_by(LicensePlate.type).all()
+    
+    # 映射表
+    label_map = {
+        'BlueCard': '蓝牌',
+        'GreenCard': '绿牌',
+        'YellowCard': '黄牌',
+        'Unknown': '未知'
+    }
+    color_map = {
+        'BlueCard': '#3b82f6',   # blue-500
+        'GreenCard': '#10b981',  # emerald-500
+        'YellowCard': '#eab308', # yellow-500
+        'Unknown': '#9ca3af'     # gray-400
+    }
+    
+    labels = []
+    data = []
+    colors = []
+    
+    for type_name, count in results:
+        labels.append(label_map.get(type_name, type_name))
+        data.append(count)
+        colors.append(color_map.get(type_name, '#9ca3af'))
+        
+    return jsonify({
+        'labels': labels,
+        'data': data,
+        'colors': colors
+    })
+
+@app.route('/api/stats/history')
+def stats_history():
+    """ 历史记录 (最新的20条) """
+    # 按时间倒序查询
+    logs = LicensePlate.query.order_by(LicensePlate.time.desc()).limit(20).all()
+    
+    history_data = []
+    for log in logs:
+        history_data.append({
+            'id': log.id,
+            'time': log.time.strftime('%H:%M:%S'),
+            'plate': log.plate_text,
+            'status': 'success' if log.status == 1 else 'failed',
+            'confidence': round(log.confidence * 100, 1),
+            'location': '默认入口', # 数据库未存地点，暂用默认
+            'duration': log.duration
+        })
+        
+    # 同时计算一下总计数据
+    total_count = LicensePlate.query.count()
+    success_count = LicensePlate.query.filter_by(status=1).count()
+    failed_count = LicensePlate.query.filter_by(status=0).count()
+    
+    return jsonify({
+        'logs': history_data,
+        'stats': {
+            'total': total_count,
+            'success': success_count,
+            'failed': failed_count
+        }
+    })
 
 # --- 4. 辅助路由 ---
 
@@ -304,12 +393,9 @@ def index():
 
 @app.route('/api/performance')
 def performance():
-    # CPU
     cpu_usage = psutil.cpu_percent(interval=None)
-    # 内存
     memory_info = psutil.virtual_memory()
     memory_usage = memory_info.percent
-    # GPU
     gpu_usage = 0
     gpu_name = "No GPU"
     try:
@@ -334,7 +420,6 @@ def start_flask():
     app.run(host='127.0.0.1', port=5000, threaded=True, use_reloader=False)
 
 if __name__ == '__main__':
-    # 尝试自动创建数据库表 (如果 models.py 定义了表结构)
     with app.app_context():
         try:
             db.create_all()
@@ -342,12 +427,13 @@ if __name__ == '__main__':
         except Exception as e:
             print(f"数据库警告: {e}")
 
-    # 启动 Flask 线程
     t = threading.Thread(target=start_flask)
     t.daemon = True
     t.start()
-    ocr = get_ocr_model()
-    # 启动 GUI 窗口
+    
+    # 预加载 OCR
+    get_ocr_model()
+    
     icon_path = get_resource_path('apple-touch-icon.png')
     window = webview.create_window(
         title="车牌识别系统",
