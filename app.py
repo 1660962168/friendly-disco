@@ -2,8 +2,9 @@ import webview
 import threading
 import sys
 import os
+import queue # [必须] 引入队列
 
-# --- [优化] 跳过 PaddleOCR 的联网检查，极大加快启动速度 ---
+# --- [新增] 跳过 PaddleOCR 的联网检查，加快启动速度 ---
 os.environ['DISABLE_MODEL_SOURCE_CHECK'] = 'True' 
 
 import glob
@@ -31,13 +32,17 @@ from sqlalchemy import func
 # --- 1. 全局配置与初始化 ---
 
 ocr_engine = None 
+# [新增] OCR 任务队列
+ocr_queue = queue.Queue(maxsize=100)
+# [新增] 视频播放状态标记
+IS_VIDEO_RUNNING = False
 
 def get_ocr_model():
     """ 懒加载 OCR 模型单例模式 """
     global ocr_engine
     if ocr_engine is None:
         print("正在初始化 OCR 模型 (第一次运行会稍慢)...")
-        # 显式指定模型路径或名称，确保 det 和 rec 都加载
+        # [保持] 你原有的初始化参数
         ocr_engine = PaddleOCR(
             text_detection_model_name="PP-OCRv5_server_det",
             text_recognition_model_name="PP-OCRv5_server_rec",
@@ -98,6 +103,113 @@ except Exception as e:
 
 # 定义全局变量
 CURRENT_DETECTED_CLASS = None 
+
+# --- [新增] 视频状态查询接口 ---
+@app.route('/api/video/status')
+def video_status():
+    return jsonify({'running': IS_VIDEO_RUNNING})
+
+# --- [核心] OCR 后台工作线程 ---
+# 完全复用你提供的 predict 逻辑和解析方式
+def ocr_worker():
+    print("OCR 后台工作线程已启动...")
+    ocr = get_ocr_model()
+    PROVINCES = "京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领"
+
+    while True:
+        try:
+            task = ocr_queue.get()
+            if task is None: break
+            
+            plate_crop, plate_type = task
+            
+            # 图像预处理
+            roi = cv2.resize(plate_crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            gray_inv = cv2.bitwise_not(gray)
+            gray_inv_bgr = cv2.cvtColor(gray_inv, cv2.COLOR_GRAY2BGR)
+            
+            candidates = []
+            
+            # 识别循环
+            for img_input, label in [(gray_bgr, "Normal"), (gray_inv_bgr, "Inverted")]:
+                try:
+                    # [保持] 使用 predict
+                    res = ocr.predict(img_input)
+                    
+                    text_res = ""
+                    score_res = 0.0
+                    
+                    # [保持] 你的解析逻辑
+                    if res:
+                        if isinstance(res, list) and len(res) > 0:
+                            item = res[0]
+                            if isinstance(item, dict) and 'rec_texts' in item and len(item['rec_texts']) > 0:
+                                text_res = item['rec_texts'][0]
+                                score_res = float(item['rec_scores'][0])
+                            elif isinstance(item, list) and len(item) >= 2:
+                                text_res = item[1][0]
+                                score_res = float(item[1][1])
+                    
+                    if text_res:
+                        clean_text = re.sub(r'[^\u4e00-\u9fa5A-Z0-9]', '', text_res)
+                        is_valid = False
+                        current_score = score_res
+                        if len(clean_text) >= 2 and clean_text[0] in PROVINCES:
+                            is_valid = True
+                            current_score += 0.5
+                        if label == "Inverted" and is_valid:
+                            current_score += 0.2
+                        if len(clean_text) > 1:
+                            candidates.append({'text': clean_text, 'score': current_score, 'valid': is_valid})
+                except Exception:
+                    pass 
+
+            # 入库
+            if candidates:
+                candidates.sort(key=lambda x: (x['valid'], x['score']), reverse=True)
+                best = candidates[0]
+                plate_text = best['text']
+                plate_confidence = min(0.99, best['score'])
+                
+                # [保持] 正则校验
+                status = 0
+                regex_common = r'^[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼][A-HJ-NP-Z][A-HJ-NP-Z0-9]{4}[A-HJ-NP-Z0-9挂学警港澳]$'
+                regex_new_energy = r'^[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼][A-HJ-NP-Z](([DF][A-HJ-NP-Z0-9][0-9]{4})|([0-9]{5}[DF]))$'
+                
+                if re.match(regex_common, plate_text) or re.match(regex_new_energy, plate_text):
+                    status = 1
+                
+                with app.app_context():
+                    try:
+                        existing_record = LicensePlate.query.filter_by(plate_text=plate_text).first()
+                        if existing_record:
+                            existing_record.time = datetime.now()
+                            existing_record.status = status
+                            existing_record.confidence = plate_confidence
+                            existing_record.duration = 0.1 
+                            db.session.commit()
+                            print(f"[OCR] 更新: {plate_text}")
+                        else:
+                            record = LicensePlate(
+                                plate_text=plate_text,
+                                type=plate_type,
+                                status=status,
+                                confidence=plate_confidence,
+                                duration=0.1
+                            )
+                            db.session.add(record)
+                            db.session.commit()
+                            print(f"[OCR] 新增: {plate_text}")
+                    except Exception as db_e:
+                        db.session.rollback()
+                        print(f"DB Error: {db_e}")
+
+            ocr_queue.task_done()
+            
+        except Exception as e:
+            print(f"Worker Error: {e}")
 
 # --- 3. 核心 API 路由 ---
 
@@ -207,6 +319,7 @@ def detect_yolo():
     
 @app.route('/api/detect/ocr', methods=['POST'])
 def detect_ocr():
+    # 保持原有的单张图 OCR 接口逻辑
     start_time = time.time()
     data = request.json
     crop_filename = data.get('crop_filename')
@@ -224,7 +337,6 @@ def detect_ocr():
     try:
         ocr = get_ocr_model()
         plate_crop = cv2.imread(crop_path)
-        # 图像增强
         roi = cv2.resize(plate_crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         gray_inv = cv2.bitwise_not(gray)
@@ -234,26 +346,19 @@ def detect_ocr():
         PROVINCES = "京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领"
         candidates = []
 
-        # 图片上传模式，背景复杂，使用默认的 ocr.ocr(det=True) 或者 predict
-        # 为了兼容性，这里使用 ocr.ocr(det=False) 因为我们已经有 crop 了
-        # 但如果是用户手动上传的很乱的 crop，可能需要 det=True
-        # 这里保持之前的逻辑（predict 或 ocr），但建议统一用 ocr
-        
         for img_input, label in [(gray_bgr, "Normal"), (gray_inv_bgr, "Inverted")]:
-            # [修改] 使用标准的 ocr 接口，关闭检测，只做识别
-            res = ocr.ocr(img_input, det=False, rec=True, cls=False)
-            
+            res = ocr.predict(img_input)
             text_res = ""
             score_res = 0.0
-            
-            # 解析 det=False 的结果: [[('文本', 0.99)]]
-            if res and isinstance(res, list):
-                for item in res:
-                    if isinstance(item, list) and len(item) >= 1:
-                        # item 是 [('text', score)]
-                        if isinstance(item[0], tuple) or isinstance(item[0], list):
-                            text_res = item[0][0]
-                            score_res = float(item[0][1])
+            if res:
+                if isinstance(res, list) and len(res) > 0:
+                    item = res[0]
+                    if isinstance(item, dict) and 'rec_texts' in item and len(item['rec_texts']) > 0:
+                        text_res = item['rec_texts'][0]
+                        score_res = float(item['rec_scores'][0])
+                    elif isinstance(item, list) and len(item) >= 2:
+                        text_res = item[1][0]
+                        score_res = float(item[1][1])
             
             if text_res:
                 clean_text = re.sub(r'[^\u4e00-\u9fa5A-Z0-9]', '', text_res)
@@ -278,9 +383,14 @@ def detect_ocr():
             
             global CURRENT_DETECTED_CLASS
             plate_type = CURRENT_DETECTED_CLASS if CURRENT_DETECTED_CLASS else "Unknown"
-            status = 1 if (len(plate_text) == 7 or len(plate_text) == 8) else 0
             
-            # 数据库逻辑
+            status = 0
+            regex_common = r'^[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼][A-HJ-NP-Z][A-HJ-NP-Z0-9]{4}[A-HJ-NP-Z0-9挂学警港澳]$'
+            regex_new_energy = r'^[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼][A-HJ-NP-Z](([DF][A-HJ-NP-Z0-9][0-9]{4})|([0-9]{5}[DF]))$'
+            
+            if re.match(regex_common, plate_text) or re.match(regex_new_energy, plate_text):
+                status = 1
+            
             try:
                 existing_record = LicensePlate.query.filter_by(plate_text=plate_text).first()
                 if existing_record:
@@ -316,10 +426,11 @@ def detect_ocr():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-# --- 视频识别模块 (深度修复版) ---
+# --- 视频识别模块 ---
 
 @app.route('/api/detect/video_upload', methods=['POST'])
 def detect_video_upload():
+    global IS_VIDEO_RUNNING
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
     file = request.files['file']
@@ -332,6 +443,9 @@ def detect_video_upload():
         safe_filename = f"video_{uuid.uuid4().hex}{ext}"
         filepath = os.path.join(UPLOAD_FOLDER, safe_filename)
         file.save(filepath)
+        
+        # [关键] 上传成功即标记为开始，防止前端 polling 提前检测到 False
+        IS_VIDEO_RUNNING = True
 
         return jsonify({
             'success': True,
@@ -339,10 +453,14 @@ def detect_video_upload():
             'stream_url': url_for('video_feed', filename=safe_filename)
         })
     except Exception as e:
+        IS_VIDEO_RUNNING = False
         return jsonify({'error': str(e)}), 500
 
-# [核心修复函数] 视频流生成
+# [重点修改] 异步视频流处理 + 状态管理
 def generate_video_frames(video_path):
+    global IS_VIDEO_RUNNING
+    IS_VIDEO_RUNNING = True
+    
     conf_threshold = 0.25
     with app.app_context():
         try:
@@ -353,118 +471,45 @@ def generate_video_frames(video_path):
             pass
 
     cap = cv2.VideoCapture(video_path)
-    ocr = get_ocr_model()
-    PROVINCES = "京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼使领"
-
-    # OCR 辅助函数：处理单张小图
-    def recognize_plate(img_crop):
-        # 1. 预处理
-        roi = cv2.resize(img_crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        
-        candidates = []
-        
-        # 2. 尝试正色 (gray_bgr) 和 反色 (gray_inv_bgr)
-        # 视频流为了速度，可以只做一次，但为了准确率，建议做两次尝试
-        gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        gray_inv = cv2.bitwise_not(gray)
-        gray_inv_bgr = cv2.cvtColor(gray_inv, cv2.COLOR_GRAY2BGR)
-        
-        for input_img in [gray_bgr, gray_inv_bgr]:
-            try:
-                # [关键] det=False 强制关闭检测，只做识别
-                res = ocr.ocr(input_img, det=False, rec=True, cls=False)
+    
+    try:
+        while cap.isOpened():
+            success, frame = cap.read()
+            if not success:
+                break
                 
-                # 解析结果: [[('苏E05EV9', 0.99)]]
-                if res and isinstance(res, list):
-                    for item in res:
-                        if isinstance(item, list) and len(item) >= 1:
-                            text_data = item[0] # ('text', score)
-                            if isinstance(text_data, tuple) or isinstance(text_data, list):
-                                text = text_data[0]
-                                score = float(text_data[1])
-                                
-                                # 简单清洗
-                                clean = re.sub(r'[^\u4e00-\u9fa5A-Z0-9]', '', text)
-                                if len(clean) >= 7 and clean[0] in PROVINCES:
-                                    candidates.append((clean, score))
-            except Exception:
-                pass
-        
-        if candidates:
-            # 返回置信度最高的
-            candidates.sort(key=lambda x: x[1], reverse=True)
-            return candidates[0] # (text, score)
-        
-        return None, 0.0
-
-    while cap.isOpened():
-        success, frame = cap.read()
-        if not success:
-            break
+            results = model(frame, conf=conf_threshold, verbose=False)
+            annotated_frame = frame.copy()
             
-        # YOLO 检测
-        results = model(frame, conf=conf_threshold, verbose=False)
-        annotated_frame = frame.copy()
-        
-        for result in results:
-            boxes = result.boxes
-            for box in boxes:
-                # 获取坐标
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cls_id = int(box.cls[0])
-                cls_name = result.names[cls_id]
-                
-                # 绘制绿色框
-                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                
-                # 裁剪车牌区域
-                h, w, _ = frame.shape
-                # 稍微扩大一点点，防止贴边
-                pad = 5
-                crop_x1, crop_y1 = max(0, x1 - pad), max(0, y1 - pad)
-                crop_x2, crop_y2 = min(w, x2 + pad), min(h, y2 + pad)
-                plate_crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
-                
-                # OCR 识别
-                text, score = recognize_plate(plate_crop)
-                
-                if text:
-                    # 数据库操作 (在 app context 中)
-                    with app.app_context():
-                        try:
-                            existing = LicensePlate.query.filter_by(plate_text=text).first()
-                            if existing:
-                                existing.time = datetime.now()
-                                existing.confidence = score
-                                existing.status = 1
-                                db.session.commit()
-                            else:
-                                new_plate = LicensePlate(
-                                    plate_text=text,
-                                    type=cls_name,
-                                    status=1,
-                                    confidence=score,
-                                    duration=0.1 # 视频流模拟耗时
-                                )
-                                db.session.add(new_plate)
-                                db.session.commit()
-                        except:
-                            db.session.rollback()
+            for result in results:
+                boxes = result.boxes
+                for box in boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    cls_id = int(box.cls[0])
+                    cls_name = result.names[cls_id]
                     
-                    # 绘制文字 (注意：cv2 不支持中文，这里用 ASCII 字符代替或简单绘制)
-                    # 为了避免乱码，只绘制 "Plate Found" 或 英文部分，前端列表会显示中文
-                    # 这里做一个简单的处理：尝试绘制，如果是乱码也不影响程序运行
-                    display_text = f"Conf: {score:.2f}" 
-                    cv2.putText(annotated_frame, display_text, (x1, y1 - 10), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    
+                    h, w, _ = frame.shape
+                    pad = 5
+                    crop_x1, crop_y1 = max(0, x1 - pad), max(0, y1 - pad)
+                    crop_x2, crop_y2 = min(w, x2 + pad), min(h, y2 + pad)
+                    
+                    plate_crop = frame[crop_y1:crop_y2, crop_x1:crop_x2].copy()
+                    
+                    if not ocr_queue.full():
+                        ocr_queue.put((plate_crop, cls_name))
+                    
+                    cv2.putText(annotated_frame, f"{cls_name}", (x1, y1 - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-        # 编码图片推流
-        ret, buffer = cv2.imencode('.jpg', annotated_frame)
-        frame_bytes = buffer.tobytes()
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-
-    cap.release()
+            ret, buffer = cv2.imencode('.jpg', annotated_frame)
+            frame_bytes = buffer.tobytes()
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+    finally:
+        # [关键] 视频流结束（无论播放完还是断开），标记为停止
+        IS_VIDEO_RUNNING = False
+        cap.release()
 
 @app.route('/video_feed/<filename>')
 def video_feed(filename):
@@ -588,6 +633,9 @@ if __name__ == '__main__':
         try:
             db.create_all()
         except: pass
+    
+    # 启动后台线程
+    threading.Thread(target=ocr_worker, daemon=True).start()
 
     t = threading.Thread(target=start_flask)
     t.daemon = True
@@ -598,6 +646,8 @@ if __name__ == '__main__':
         title="车牌识别系统",
         url='http://127.0.0.1:5000',
         width=1480, height=900,
-        resizable=True, confirm_close=True
+        resizable=True, confirm_close=True,
+        min_size=(1480, 900),
+        resizable=False,
     )
-    webview.start(icon=icon_path)
+    webview.start(icon=icon_path) 

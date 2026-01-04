@@ -24,6 +24,9 @@ const els = {
     btnDownload: document.getElementById('btn-download-history'),
 };
 
+// --- [核心修改] 轮询定时器变量 ---
+let videoPollTimer = null;
+
 function renderLogs() {
     if (!state.logs || state.logs.length === 0) {
         els.logList.innerHTML = '<div class="text-center text-gray-400 py-4">暂无记录</div>';
@@ -73,7 +76,7 @@ function updateDistribution() { fetch('/api/stats/distribution').then(res => res
 function updateHistoryAndStats(searchQuery = "") {
     let url = '/api/stats/history';
     if (searchQuery) url += `?search=${encodeURIComponent(searchQuery)}`;
-    fetch(url).then(res => res.json()).then(data => {
+    return fetch(url).then(res => res.json()).then(data => {
         state.logs = data.logs; renderLogs();
         if(data.stats) {
             if(els.statTotal) els.statTotal.innerText = data.stats.total;
@@ -86,6 +89,7 @@ function updateHistoryAndStats(searchQuery = "") {
             if(els.logSuccess) els.logSuccess.innerText = data.stats.success;
             if(els.logFail) els.logFail.innerText = data.stats.failed;
         }
+        return data;
     }).catch(console.error);
 }
 
@@ -97,6 +101,7 @@ function updatePerformance() {
     }).catch(console.error);
 }
 
+// --- 图片识别 ---
 window.handleImageUpload = function(input) {
     if (input.files && input.files[0]) {
         const file = input.files[0];
@@ -133,14 +138,65 @@ function startOcrRequest(cropFilename) {
     }).catch(console.error);
 }
 
-window.resetImageUpload = function() { document.getElementById('image-upload').value = ""; document.getElementById('image-upload-area').classList.remove('hidden'); document.getElementById('image-result-container').classList.add('hidden'); document.getElementById('status-badge').innerText = "待机中"; renderSegmentation(null); }
-window.toggleSettings = function (show) { const modal = document.getElementById('settings-modal'); show ? modal.classList.remove('hidden') : modal.classList.add('hidden'); }
-window.toggleTheme = function () { const html = document.documentElement; if (html.classList.contains('dark')) { html.classList.remove('dark'); localStorage.theme = 'light'; } else { html.classList.add('dark'); localStorage.theme = 'dark'; } lucide.createIcons(); }
-function initTheme() { if (localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) { document.documentElement.classList.add('dark'); } lucide.createIcons(); }
-initTheme();
+window.resetImageUpload = function() { 
+    document.getElementById('image-upload').value = ""; 
+    document.getElementById('image-upload-area').classList.remove('hidden'); 
+    document.getElementById('image-result-container').classList.add('hidden'); 
+    document.getElementById('image-preview').src = ""; 
+    
+    // [修复] 重置状态栏
+    if(els.statusBadge) {
+        els.statusBadge.innerText = "待机中";
+        els.statusBadge.className = "px-3 py-1.5 rounded-lg text-xs bg-gray-100 text-gray-500 dark:bg-gray-800/50 dark:text-gray-400";
+    }
+    renderSegmentation(null); 
+}
 
-// 视频模块
+// --- [核心] 视频轮询逻辑 ---
+function startVideoPolling() {
+    stopVideoPolling(); 
+    // 每 1.5 秒检查一次后台状态
+    videoPollTimer = setInterval(() => {
+        // 1. 检查视频是否结束
+        fetch('/api/video/status').then(r => r.json()).then(status => {
+            if (!status.running) {
+                // 如果后端说视频已经不运行了，则重置前端
+                resetVideoUpload();
+                return;
+            }
+            // 2. 如果还在运行，更新数据
+            updateTrend();
+            updateDistribution();
+            updateHistoryAndStats().then(data => {
+                if (data && data.logs && data.logs.length > 0) {
+                    const latestLog = data.logs[0];
+                    renderSegmentation(latestLog.plate);
+                    if (els.charConf) els.charConf.innerText = latestLog.confidence + '%';
+                    if (els.processTime) els.processTime.innerText = latestLog.duration;
+                    if(els.statusBadge) { 
+                         els.statusBadge.innerText = `视频识别中: ${latestLog.plate}`; 
+                         els.statusBadge.className = "px-3 py-1.5 rounded-lg text-xs bg-emerald-50 text-emerald-600 border border-emerald-200 animate-pulse"; 
+                    }
+                }
+            });
+        }).catch(err => {
+            console.log("Polling error:", err);
+            // 出错也可能是断开了，安全起见重置
+            resetVideoUpload();
+        });
+    }, 1500);
+}
+
+function stopVideoPolling() {
+    if (videoPollTimer) {
+        clearInterval(videoPollTimer);
+        videoPollTimer = null;
+    }
+}
+
+// --- 视频模块 ---
 const videoEls = { uploadInput: document.getElementById('video-upload'), uploadArea: document.getElementById('video-upload-area'), resultContainer: document.getElementById('video-result-container'), streamImg: document.getElementById('video-stream-img'), loading: document.getElementById('video-loading') };
+
 window.handleVideoUpload = function(input) {
     if (input.files && input.files[0]) {
         videoEls.uploadArea.classList.add('hidden'); videoEls.resultContainer.classList.remove('hidden'); videoEls.loading.classList.remove('hidden');
@@ -150,22 +206,75 @@ window.handleVideoUpload = function(input) {
                 videoEls.streamImg.onload = () => { videoEls.loading.classList.add('hidden'); };
                 videoEls.streamImg.src = data.stream_url;
                 setTimeout(() => videoEls.loading.classList.add('hidden'), 2000);
+                startVideoPolling(); // 开始轮询
             } else { alert("上传失败: " + data.error); resetVideoUpload(); }
         }).catch(err => { alert("上传出错"); resetVideoUpload(); });
     }
 };
-window.stopVideoRecognition = function() { videoEls.streamImg.src = ""; alert("识别已停止"); };
-window.resetVideoUpload = function() { videoEls.streamImg.src = ""; videoEls.uploadInput.value = ""; videoEls.resultContainer.classList.add('hidden'); videoEls.uploadArea.classList.remove('hidden'); videoEls.loading.classList.add('hidden'); };
 
+window.stopVideoRecognition = function() { 
+    videoEls.streamImg.src = ""; 
+    stopVideoPolling(); 
+    alert("识别已停止"); 
+};
+
+window.resetVideoUpload = function() { 
+    videoEls.streamImg.src = ""; 
+    videoEls.uploadInput.value = ""; 
+    videoEls.resultContainer.classList.add('hidden'); 
+    videoEls.uploadArea.classList.remove('hidden'); 
+    videoEls.loading.classList.add('hidden');
+    
+    // [修复] 重置状态栏
+    if(els.statusBadge) {
+        els.statusBadge.innerText = "待机中";
+        els.statusBadge.className = "px-3 py-1.5 rounded-lg text-xs bg-gray-100 text-gray-500 dark:bg-gray-800/50 dark:text-gray-400";
+    }
+    renderSegmentation(null);
+    stopVideoPolling(); 
+};
+
+// --- [修复] 模式切换逻辑 ---
 window.switchVideoMode = function (mode) {
     const imgView = document.getElementById('image-view'); const vidView = document.getElementById('video-view');
     const titleContainer = document.getElementById('mode-title-container');
     const btnImage = document.getElementById('btn-image'); const btnVideo = document.getElementById('btn-video');
+    
+    // 无论切换到哪个模式，先停止视频轮询，防止后台继续请求
+    stopVideoPolling();
+
     const setBtnActive = (btn, active) => { btn.className = active ? "px-4 py-2 rounded-md text-sm transition-all bg-white text-cyan-600 border border-cyan-200 shadow-sm dark:bg-cyan-500/20 dark:text-cyan-400 dark:border-cyan-500/50 dark:shadow-[0_0_10px_rgba(34,211,238,0.2)]" : "px-4 py-2 rounded-md text-sm transition-all text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-300 border border-transparent"; };
-    if (mode === 'image') { titleContainer.innerHTML = `<i data-lucide="image" class="w-5 h-5 text-cyan-400"></i><h2 class="text-lg font-medium">图片识别</h2>`; imgView.style.display = 'flex'; vidView.style.display = 'none'; setBtnActive(btnImage, true); setBtnActive(btnVideo, false); } 
-    else { titleContainer.innerHTML = `<i data-lucide="video" class="w-5 h-5 text-cyan-400"></i><h2 class="text-lg font-medium">视频识别</h2>`; imgView.style.display = 'none'; vidView.style.display = 'flex'; vidView.classList.remove('hidden'); setBtnActive(btnImage, false); setBtnActive(btnVideo, true); }
+
+    if (mode === 'image') { 
+        titleContainer.innerHTML = `<i data-lucide="image" class="w-5 h-5 text-cyan-400"></i><h2 class="text-lg font-medium">图片识别</h2>`; 
+        imgView.style.display = 'flex'; 
+        vidView.style.display = 'none'; 
+        setBtnActive(btnImage, true); 
+        setBtnActive(btnVideo, false); 
+        
+        // [关键] 切换时强制重置两个模块
+        resetVideoUpload();
+        resetImageUpload();
+
+    } else { 
+        titleContainer.innerHTML = `<i data-lucide="video" class="w-5 h-5 text-cyan-400"></i><h2 class="text-lg font-medium">视频识别</h2>`; 
+        imgView.style.display = 'none'; 
+        vidView.style.display = 'flex'; 
+        vidView.classList.remove('hidden'); 
+        setBtnActive(btnImage, false); 
+        setBtnActive(btnVideo, true); 
+        
+        // [关键] 切换时强制重置两个模块
+        resetImageUpload();
+        resetVideoUpload();
+    }
     lucide.createIcons();
 }
+
+window.toggleSettings = function (show) { const modal = document.getElementById('settings-modal'); show ? modal.classList.remove('hidden') : modal.classList.add('hidden'); }
+window.toggleTheme = function () { const html = document.documentElement; if (html.classList.contains('dark')) { html.classList.remove('dark'); localStorage.theme = 'light'; } else { html.classList.add('dark'); localStorage.theme = 'dark'; } lucide.createIcons(); }
+function initTheme() { if (localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) { document.documentElement.classList.add('dark'); } lucide.createIcons(); }
+initTheme();
 
 // 设置保存
 const confInput = document.getElementById('conf-threshold-input');
